@@ -89,6 +89,8 @@ lightferry mobile-serve --path ./my-folder --key-file lightferry.key
 
 The server binds this machine's LAN IP only (use `--host` to pick another address) and accepts one WebSocket client at a time (a second gets HTTP 409). Open the printed Phone URL on the phone (accept the self-signed certificate warning), press Start, and point it at the screen page; confirm the VERIFY code with the on-screen buttons on both the screen page and the phone. This is a test tool, not the real path. `python -m lightferry.mobile ...` is the same as `lightferry mobile-serve ...`.
 
+> **No key file?** Both machines can derive the key from a shared passphrase: set `LIGHTFERRY_PASSPHRASE` (12+ characters) instead of passing `--key-file`. See the usage guide.
+
 ## CLI reference
 
 | Command | Purpose |

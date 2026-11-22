@@ -27,8 +27,37 @@ def _err(msg: str) -> int:
 
 # ---------------------------------------------------------------- keys
 
-def load_key(key_file: str | None, key_hex: str | None) -> bytes:
+PASSPHRASE_MIN = 12
+PASSPHRASE_SALT = b"lightferry-psk-v1"  # fixed domain-separation salt: the same phrase gives the same key everywhere
+
+
+def derive_psk(passphrase: str) -> bytes:
+    """32-byte PSK from a passphrase (scrypt n=2**15, r=8, p=1). Never printed or logged."""
+    import hashlib
+    if len(passphrase) < PASSPHRASE_MIN:
+        raise ValueError(f"passphrase too short (need >= {PASSPHRASE_MIN} characters)")
+    return hashlib.scrypt(passphrase.encode("utf-8"), salt=PASSPHRASE_SALT, n=2 ** 15, r=8, p=1, dklen=32,
+                          maxmem=128 * 1024 * 1024)
+
+
+def _read_passphrase(value: str) -> str:
+    if value.startswith("@"):  # @file: first line, trailing newline removed
+        return Path(value[1:]).expanduser().read_text(encoding="utf-8").split("\n", 1)[0].rstrip("\r")
+    return value
+
+
+def load_key(key_file: str | None, key_hex: str | None, passphrase: str | None = None) -> bytes:
+    """--key / --key-file / LIGHTFERRY_KEY first; a passphrase (--passphrase or LIGHTFERRY_PASSPHRASE) only when
+    none of those is given. --passphrase together with --key/--key-file is an error."""
     from .protocol import MIN_PSK_LEN
+    if passphrase and (key_hex or key_file):
+        raise ValueError("--passphrase cannot be combined with --key or --key-file")
+    if not (key_hex or key_file or passphrase or os.environ.get("LIGHTFERRY_KEY")):
+        env_pp = os.environ.get("LIGHTFERRY_PASSPHRASE")
+        if env_pp:
+            return derive_psk(_read_passphrase(env_pp))
+    if passphrase:
+        return derive_psk(_read_passphrase(passphrase))
     if key_hex:
         print("warning: --key on the command line is visible in the process list; prefer --key-file or "
               "LIGHTFERRY_KEY", file=sys.stderr)
@@ -38,7 +67,8 @@ def load_key(key_file: str | None, key_hex: str | None) -> bytes:
     else:
         src = os.environ.get("LIGHTFERRY_KEY", "")
         if not src:
-            raise ValueError("no key: use --key-file FILE, --key HEX or LIGHTFERRY_KEY (create one with `lightferry keygen`)")
+            raise ValueError("no key: use --key-file FILE, --key HEX, LIGHTFERRY_KEY (create one with `lightferry keygen`) "
+                             "or a passphrase (LIGHTFERRY_PASSPHRASE or --passphrase)")
     if src.startswith("@"):
         raw = Path(src[1:]).expanduser().read_bytes()
         try:
@@ -327,6 +357,8 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--path", help="file/folder to send, or destination dir when receiving")
     ap.add_argument("--key-file", help="32-byte key file (or hex text), see `lightferry keygen`")
     ap.add_argument("--key", help="hex key (LEAKS to the process list; prefer --key-file / env LIGHTFERRY_KEY)")
+    ap.add_argument("--passphrase", help="derive the key from a passphrase (>= 12 chars; @FILE reads it from a file; "
+                    "prefer env LIGHTFERRY_PASSPHRASE: command-line values leak to the process list)")
     ap.add_argument("--camera", default="webcam", help="webcam | dir:<path> | loop (loop: selftest only)")
     ap.add_argument("--camera-index", type=int, default=0)
     ap.add_argument("--backchannel", choices=("auto", "camera", "audio"), default="auto")
@@ -370,9 +402,10 @@ def main(argv=None) -> int:
         sp.add_argument("--out", help="where received files go (default out/received; --remote-sender: --path)")
         sp.add_argument("--key-file")
         sp.add_argument("--key")
+        sp.add_argument("--passphrase")
         a = sp.parse_args(rest)
         try:
-            key = load_key(a.key_file, a.key)
+            key = load_key(a.key_file, a.key, a.passphrase)
             from . import mobile
         except ImportError as e:
             return _err(f"mobile-serve needs the 'mobile' extra / mobile module: {e}")
@@ -396,7 +429,7 @@ def main(argv=None) -> int:
         a.tiles = parse_tiles(a.tiles)
         if a.yes and a.camera == "webcam":
             return _err("--yes is a test hook: only with --camera dir: (real hardware always asks VERIFY)")
-        psk = load_key(a.key_file, a.key)
+        psk = load_key(a.key_file, a.key, a.passphrase)
         if a.receive:
             if a.no_camera:
                 return _err("--receive needs a camera")

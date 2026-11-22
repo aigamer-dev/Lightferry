@@ -91,3 +91,28 @@ Needs the `mobile` extra. Binds this machine's LAN IP unless `--host` is given. 
 ## Planned
 
 `lightferry cmd` and `lightferry serve` (a signed command channel) are not implemented. The wire format reserves CMD/RESULT packet types only.
+
+## Keys from a passphrase
+
+If you do not want to carry a key file between machines, both sides can derive the same 32-byte key from a
+shared passphrase (at least 12 characters) using scrypt with a fixed salt. Type the same phrase on both
+machines yourself; never send it through chat or e-mail.
+
+```bash
+# Linux/macOS
+export LIGHTFERRY_PASSPHRASE='your shared phrase'
+lightferry --send --path ./folder
+```
+
+```powershell
+# Windows PowerShell
+$env:LIGHTFERRY_PASSPHRASE = 'your shared phrase'
+lightferry --receive --path .\incoming
+```
+
+- `--passphrase PHRASE` (or `--passphrase @FILE`) does the same, but a command-line value is visible in the
+  process list, so prefer the environment variable.
+- `--key`, `--key-file` and `LIGHTFERRY_KEY` take precedence; `--passphrase` cannot be combined with
+  `--key` or `--key-file`.
+- A passphrase is weaker than a random key file: anyone who records the codes can try guesses offline. Use a
+  long, random phrase.

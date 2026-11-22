@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "lightferry"
+version = "0.0.1a1"
+description = "Visual sneakernet: move files between air-gapped machines via screen-shown codes scanned by webcam."
+readme = "README.md"
+requires-python = ">=3.11.4"
+dependencies = ["numpy>=1.26", "opencv-python>=4.8"]
+
+[project.optional-dependencies]
+dev = ["pytest", "build"]
+mobile = ["aiohttp>=3.9", "segno>=1.6", "cryptography>=42"]
+audio = ["sounddevice>=0.4"]
+
+[project.scripts]
+lightferry = "lightferry.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/lightferry"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

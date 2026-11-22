@@ -1,0 +1,44 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lightferry sender screen</title>
+<style>
+body{margin:0;background:#000;color:#eee;font:16px system-ui,sans-serif;display:flex;flex-direction:column;height:100vh}
+#bar.hide>*:not(#tg){display:none}
+#bar{padding:8px 12px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;border-bottom:1px solid #333}
+#banner{background:#ffe08a;padding:8px 12px;display:none}
+#stage{flex:1;display:flex;align-items:center;justify-content:center;background:#000;min-height:0}
+#frame{max-width:100%;max-height:100%;image-rendering:pixelated;image-rendering:crisp-edges;image-rendering:pixelated}
+#msg{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:16px;text-align:center;padding:24px;font-size:24px;color:#ccc;z-index:5}
+#stage{position:relative}
+#code{font:700 32px monospace;letter-spacing:4px}
+button{font-size:16px;padding:6px 12px}
+body.fs #bar{display:none}
+</style></head><body>
+<div id="bar"><button id="tg">Panel</button><b>Lightferry sender</b><span id="st">...</span><span id="code"></span>
+<button id="ok" hidden>Codes match</button><button id="no" hidden>Reject</button>
+<label>Back-channel <select id="bc"><option value="audio">audio</option><option value="direct">direct (test shortcut)</option></select></label>
+<button id="fs">Fullscreen</button></div>
+<div id="banner"></div>
+<div id="stage"><img id="frame" alt="frame" hidden><div id="msg"><div id="mt"></div><img id="qr" alt="phone link QR" style="width:min(50vh,50vw);image-rendering:pixelated;background:#fff;display:none"><button id="ns" hidden>New session</button></div></div>
+<script>
+const t=new URLSearchParams(location.search).get('t');const q='?t='+t;let v=-1,fsOn=false;
+const $=i=>document.getElementById(i);
+async function post(u,b){return fetch(u+q,{method:'POST',body:JSON.stringify(b)})}
+$('ok').onclick=()=>post('/api/sender_answer',{ok:true});$('no').onclick=()=>post('/api/sender_answer',{ok:false});
+$('bc').onchange=async e=>{const r=await(await post('/api/backchannel',{mode:e.target.value})).json();$('bc').value=r.mode};
+$('ns').onclick=()=>post('/api/restart',{});
+$('tg').onclick=()=>$('bar').classList.toggle('hide');
+$('fs').onclick=()=>{document.documentElement.requestFullscreen();document.body.classList.add('fs')};
+document.onfullscreenchange=()=>{if(!document.fullscreenElement)document.body.classList.remove('fs')};
+async function tick(){try{const s=await(await fetch('/status.json'+q)).json();const S=s.sender,R=s.receiver;
+$('st').textContent=`sender ${S.state} ${S.progress.join('/')} | receiver ${R.state} ${R.progress.join('/')}`+(S.abort?` | ABORT ${S.abort}`:'')+(S.warning?` | ${S.warning}`:'');
+$('code').textContent=S.verify||'';$('ok').hidden=$('no').hidden=!S.verify;
+if(document.activeElement!==$('bc'))$('bc').value=s.backchannel;
+const idle=s.state==='IDLE',ended=!!s.ended;
+$('frame').hidden=idle;$('msg').style.display=(idle||ended)?'flex':'none';$('ns').hidden=!ended;
+$('mt').textContent=idle?(s.message||'Waiting for phone \u2014 scan the QR and press Start'):ended?('Session ended: '+(S.abort||R.abort||(R.done?'transfer complete':S.state))):'';
+if(idle)$('st').textContent='IDLE';
+if(idle&&!$('qr').src)$('qr').src='/qr.png'+q;$('qr').style.display=idle?'block':'none';
+$('banner').style.display=s.banner?'block':'none';$('banner').textContent=s.banner;
+if(!idle&&s.frame_v!==v){v=s.frame_v;$('frame').src='/frame.png'+q+'&v='+v}}catch(e){}setTimeout(tick,150)}
+tick();
+</script></body></html>

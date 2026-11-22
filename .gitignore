@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Virtualenv
+.venv/
+
+# Secrets
+.env
+
+# Logs and output
+*.log
+out/
+
+# Keys and local tooling
+*.key
+outputlog
+.claude/

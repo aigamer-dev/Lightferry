@@ -1,0 +1,52 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lightferry phone</title>
+<style>
+body{margin:0;padding:12px;font:16px system-ui,sans-serif;background:#111;color:#eee}
+button{font-size:22px;padding:16px 24px;width:100%;margin:6px 0;border-radius:10px;border:0;background:#2b7;color:#000}
+#code{font:700 44px monospace;letter-spacing:6px;text-align:center;margin:8px}
+video{width:100%;border-radius:8px;background:#000}pre{white-space:pre-wrap;background:#222;padding:8px}
+a{color:#7cf}
+</style></head><body>
+<button id="start">Start</button>
+<video id="v" playsinline muted hidden></video><canvas id="c" hidden></canvas>
+<div id="hint">Fill the camera view with the black-bordered frame; hold steady.</div><div id="st">idle</div><div id="code"></div>
+<button id="ok" hidden>Codes match</button>
+<div id="end" hidden><div id="reason"></div><button id="ns">New session</button></div>
+<div id="files"></div><div id="md"></div>
+<script>
+const t=new URLSearchParams(location.search).get('t');const q='?t='+t;const $=i=>document.getElementById(i);
+let ws,actx,nextT=0,inflight=false,shown='';
+$('start').onclick=async()=>{
+ $('start').hidden=true;
+ try{actx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});await actx.resume()}catch(e){$('st').textContent='audio: '+e}
+ const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1920},height:{ideal:1080}},audio:false});
+ const v=$('v');v.srcObject=stream;v.hidden=false;await v.play();
+ connect();
+ const c=$('c'),g=c.getContext('2d');
+ setInterval(()=>{if(inflight||!ws||ws.readyState!==1||!v.videoWidth)return;
+  c.width=v.videoWidth;c.height=v.videoHeight;g.drawImage(v,0,0);inflight=true;
+  c.toBlob(b=>b.arrayBuffer().then(a=>{ws.send(a);setTimeout(()=>inflight=false,150)}),'image/jpeg',0.7)},200);
+};
+function play(buf){const u8=new Uint8Array(buf);if(u8[0]!==65||!actx)return;
+ const i16=new Int16Array(buf.slice(1));const f=new Float32Array(i16.length);for(let i=0;i<f.length;i++)f[i]=i16[i]/32768;
+ const ab=actx.createBuffer(1,f.length,48000);ab.copyToChannel(f,0);const s=actx.createBufferSource();s.buffer=ab;s.connect(actx.destination);
+ nextT=Math.max(nextT,actx.currentTime+0.05);s.start(nextT);nextT+=ab.duration}
+function connect(){
+ ws=new WebSocket(`wss://${location.host}/ws${q}`);ws.binaryType='arraybuffer';
+ ws.onopen=()=>ws.send(JSON.stringify({type:'start'}));  // server begins a fresh session only now
+ ws.onmessage=e=>{if(typeof e.data==='string')return status(JSON.parse(e.data));play(e.data)};
+ ws.onclose=()=>{$('st').textContent='reconnecting...';setTimeout(connect,1500)};
+}
+$('ns').onclick=()=>fetch('/api/restart'+q,{method:'POST',body:'{}'});
+$('ok').onclick=()=>ws.send(JSON.stringify({type:'answer',ok:true}));
+function status(s){const R=s.receiver;
+ if(s.state==='IDLE'){$('st').textContent='IDLE: starting...';$('end').hidden=true;return}
+ const S=s.sender;$('end').hidden=!s.ended;
+ if(s.ended)$('reason').textContent='Session ended: '+(S.abort||R.abort||(R.done?'transfer complete':S.state));
+ $('st').textContent=`${R.state} ${R.progress.join('/')} | frame ${R.detected?'found':'not found'} tiles ${R.tiles} | backchannel ${s.backchannel}`+(R.abort?` | ABORT ${R.abort}`:'')+(R.warning?` | ${R.warning}`:'')+(s.banner?' | '+s.banner:'');
+ $('code').textContent=R.verify||'';$('ok').hidden=!R.verify||R.state!=='VERIFY';
+ if(R.done&&shown!==R.files.join()){shown=R.files.join();
+  $('files').innerHTML='<h3>Received</h3>'+R.files.map(f=>`<div><a href="/files/${encodeURI(f)}${q}">${f}</a></div>`).join('');
+  $('md').innerHTML='';R.files.filter(f=>f.endsWith('.md')).forEach(async f=>{const x=await(await fetch('/files/'+encodeURI(f)+q)).text();
+   const p=document.createElement('pre');p.textContent=f+'\n\n'+x;$('md').appendChild(p)})}}
+</script></body></html>

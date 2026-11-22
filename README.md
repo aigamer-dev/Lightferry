@@ -4,7 +4,7 @@
 
 Lightferry is a visual sneakernet. The sender shows a stream of dense black-and-white matrix codes on its screen; the receiver reads them with a webcam. The two machines are paired by an on-screen handshake, so the default mode needs no key and no setup. Add `--encrypt` with a shared key when the screen can be seen by others. No network, no USB stick, no radio.
 
-> Status: early alpha (`0.0.1a3`). The codec, protocol, archive and handshake logic are covered by tests; the real webcam, screen and audio paths have had only light testing. See [Status and limitations](#status-and-limitations).
+> Status: early alpha (`0.0.1 alpha`). The codec, protocol, archive and handshake logic are covered by tests; the real webcam, screen and audio paths have had only light testing. See [Status and limitations](#status-and-limitations).
 
 Documentation: <https://lightferry.aigamer.dev>
 
@@ -139,7 +139,7 @@ See [Security](https://lightferry.aigamer.dev/security/).
 
 ## Status and limitations
 
-- Early alpha `0.0.1a3`; formats and flags may change.
+- Early alpha `0.0.1 alpha`; formats and flags may change.
 - Real webcam, on-screen display and audio paths are lightly tested; expect tuning (`--grid`, `--module-px`, `--tiles`).
 - No error correction in the code itself: reliability comes from ack/retry, so throughput depends on camera quality.
 - Everything is held in RAM; large transfers need several times the data size in memory.

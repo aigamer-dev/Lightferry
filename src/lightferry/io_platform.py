@@ -58,6 +58,8 @@ class WebcamSource(FrameSource):
         self._stop = False
         self._skip = False
         self._fails = 0
+        self.last_img, self.frames_read, self.detected = None, 0, False
+        self.detections, self.packets_decoded = 0, 0
         self._t = threading.Thread(target=self._run, daemon=True)
         self._t.start()
         t0 = time.monotonic()
@@ -95,8 +97,19 @@ class WebcamSource(FrameSource):
         img = self.latest(timeout_s)
         if img is None:
             return None
-        pk = parse_frame(img, profiles)
+        from . import vision
+        self.last_img, self.frames_read = img, self.frames_read + 1
+        warped = vision.detect_frame(img)
+        self.detected = warped is not None
+        pk = []
+        if warped is not None:
+            self.detections += 1
+            for p in profiles or ():
+                pk = vision.extract_tiles(warped, p.grid, p.tiles_n)
+                if pk:
+                    break
         if pk:
+            self.packets_decoded += len(pk)
             self._skip = True
             return pk
         return None
@@ -136,6 +149,15 @@ class ScreenSink(FrameSink):
         self._img = render_frame(packets, profile)
         self._cv2.imshow(self.title, self._img)
         self.poll()
+
+    def preview(self, img, text: str) -> None:
+        """Show the camera image with a status line (receiver, audio mode: the window is otherwise blank)."""
+        c = self._cv2
+        v = img.copy()
+        h, w = v.shape[:2]
+        c.rectangle(v, (0, 0), (w, 28), (0, 0, 0), -1)
+        c.putText(v, text, (6, 20), c.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 1, c.LINE_AA)
+        c.imshow(self.title, v)
 
     def poll(self) -> None:
         """Pump the GUI event loop; handle keys. Call every tick."""

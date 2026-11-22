@@ -252,6 +252,17 @@ def run_receive(a, psk: bytes) -> int:
                 inbound.extend(f)
             for m in rcv.step(now, inbound):
                 end.back.send(m)
+            cam = end.source
+            if not hasattr(cam, "last_img"):  # dir: test channel has no webcam stats
+                cam = None
+            if audio and screen is not None and cam is not None and cam.last_img is not None and now - last.get("pv", 0) > 0.1:
+                last["pv"] = now
+                screen.preview(cam.last_img, f"frames {cam.frames_read}  code-found {cam.detections}  "
+                               f"packets {cam.packets_decoded}  {'FOUND' if cam.detected else 'no code in view'}")
+            if cam is not None and now - last.get("dbg", 0) > 3:
+                last["dbg"] = now
+                print(f"[R] camera: {cam.frames_read} frames, {cam.detections} with a code, "
+                      f"{cam.packets_decoded} packets decoded", flush=True)
             _tick_io(end, screen, now)
             _status(rcv, last, "R")
             if rcv.finished:

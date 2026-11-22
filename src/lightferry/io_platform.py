@@ -13,8 +13,10 @@ the session's R->S key, it names the S packet it answers), played as 4 notes aft
 """
 from __future__ import annotations
 
+import os
 import queue
 import sys
+from pathlib import Path
 import shutil
 import subprocess
 import threading
@@ -104,6 +106,7 @@ class WebcamSource(FrameSource):
         pk = []
         if warped is not None:
             self.detections += 1
+            self.last_warped = warped
             for p in profiles or ():
                 pk = vision.extract_tiles(warped, p.grid, p.tiles_n)
                 if pk:
@@ -112,7 +115,34 @@ class WebcamSource(FrameSource):
             self.packets_decoded += len(pk)
             self._skip = True
             return pk
+        if warped is not None and os.environ.get("LIGHTFERRY_DEBUG") == "1":
+            self._dump_failed(img, warped)
         return None
+
+    def _dump_failed(self, img, warped) -> None:
+        """LIGHTFERRY_DEBUG=1: save a camera frame and its warped code whenever a code was found but no packet
+        decoded (at most one pair every 2 s, 20 pairs in total) into ./lightferry-debug/."""
+        now = time.monotonic()
+        if now - getattr(self, "_dump_t", -9.0) < 2.0 or getattr(self, "_dump_n", 0) >= 20:
+            return
+        self._dump_t, self._dump_n = now, getattr(self, "_dump_n", 0) + 1
+        d = Path("lightferry-debug")
+        d.mkdir(exist_ok=True)
+        self._cv2.imwrite(str(d / f"cam-{self._dump_n:02d}.png"), img)
+        self._cv2.imwrite(str(d / f"warped-{self._dump_n:02d}.png"), warped)
+
+    def diagnostics(self) -> str:
+        """One line for the CLI: delivered resolution and how sharp the last detected code was."""
+        cv2 = self._cv2
+        w = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        s = f"camera {w}x{h}"
+        wp = getattr(self, "last_warped", None)
+        if wp is not None:
+            g = wp if wp.ndim == 2 else cv2.cvtColor(wp, cv2.COLOR_BGR2GRAY)
+            s += (f", code {g.shape[1]}x{g.shape[0]}px, sharpness {cv2.Laplacian(g, cv2.CV_64F).var():.0f}, "
+                  f"contrast {int(g.max()) - int(g.min())}")
+        return s
 
     def close(self) -> None:
         self._stop = True

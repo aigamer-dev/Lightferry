@@ -262,7 +262,7 @@ def run_receive(a, psk: bytes) -> int:
             if cam is not None and now - last.get("dbg", 0) > 3:
                 last["dbg"] = now
                 print(f"[R] camera: {cam.frames_read} frames, {cam.detections} with a code, "
-                      f"{cam.packets_decoded} packets decoded", flush=True)
+                      f"{cam.packets_decoded} packets decoded ({cam.diagnostics()})", flush=True)
             _tick_io(end, screen, now)
             _status(rcv, last, "R")
             if rcv.finished:

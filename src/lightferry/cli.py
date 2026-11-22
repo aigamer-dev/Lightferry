@@ -30,11 +30,8 @@ def _err(msg: str) -> int:
 # Open mode (--open / LIGHTFERRY_OPEN=1): both sides use this fixed, PUBLIC key. Packets are then NOT authenticated:
 # anyone who can see the screen or hear the audio can inject or replay. For local trials only.
 OPEN_PSK = __import__("hashlib").sha256(b"lightferry-open-mode-v1").digest()
-OPEN_WARNING = ("lightferry: warning: open mode: packets are NOT authenticated (anyone who can see the screen can "
-                "inject or replay) and the transfer is NOT confirmed by an operator (the 6-digit code is only logged; "
-                "add --verify to confirm it). Use --key-file for real transfers.")
-OPEN_WARNING_VERIFY = ("lightferry: warning: open mode: packets are NOT authenticated (anyone who can see the screen "
-                       "can inject or replay). The 6-digit code is still confirmed by an operator (--verify).")
+DEFAULT_NOTE = ("lightferry: no key: handshake-only mode (data is not encrypted; anyone who can see the screen can read "
+                "or inject). Add --encrypt --key-file FILE on both machines for encrypted, authenticated transfers.")
 
 PASSPHRASE_MIN = 12
 PASSPHRASE_SALT = b"lightferry-psk-v1"  # fixed domain-separation salt: the same phrase gives the same key everywhere
@@ -81,8 +78,8 @@ def load_key(key_file: str | None, key_hex: str | None, passphrase: str | None =
     else:
         src = os.environ.get("LIGHTFERRY_KEY", "")
         if not src:
-            raise ValueError("no key: use --key-file FILE, --key HEX, LIGHTFERRY_KEY (create one with `lightferry keygen`) "
-                             "a passphrase (LIGHTFERRY_PASSPHRASE or --passphrase), or --open for an unauthenticated local trial")
+            raise ValueError("--encrypt needs a key: use --key-file FILE, --key HEX, LIGHTFERRY_KEY (create one with `lightferry keygen`) "
+                             "or a passphrase (LIGHTFERRY_PASSPHRASE or --passphrase)")
     if src.startswith("@"):
         raw = Path(src[1:]).expanduser().read_bytes()
         try:
@@ -94,6 +91,20 @@ def load_key(key_file: str | None, key_hex: str | None, passphrase: str | None =
     if len(key) < MIN_PSK_LEN:
         raise ValueError(f"key too short ({len(key)} bytes, need >= {MIN_PSK_LEN})")
     return key
+
+
+def resolve_mode(a) -> tuple[bytes, bool]:
+    """(psk, encrypt). Default: no key, the handshake alone pairs the two sides (public constant PSK, nothing
+    encrypted). ``--encrypt`` needs a key (--key-file / --key / --passphrase / env) and encrypts every session
+    packet; both machines must use the same key."""
+    have_key = bool(a.key_file or a.key or a.passphrase)
+    if a.encrypt:
+        if a.open:
+            raise ValueError("--open (the default, keyless mode) cannot be combined with --encrypt")
+        return load_key(a.key_file, a.key, a.passphrase), True
+    if have_key:
+        raise ValueError("a key was given without --encrypt: add --encrypt to use it (both machines need the same key)")
+    return OPEN_PSK, False
 
 
 def cmd_keygen(a) -> int:
@@ -238,7 +249,7 @@ def run_send(a, psk: bytes) -> int:
     cfg = LinkConfig(timeout=a.timeout, retries=a.retries)
     confirm, box = operator_prompt("S")
     end, screen, closers = build_endpoint(a, "s", psk)
-    snd = box["eng"] = hs.Sender(psk, manifest, blob, cfg=for_audio(cfg) if audio else cfg, proposal=prop,
+    snd = box["eng"] = hs.Sender(psk, manifest, blob, cfg=for_audio(cfg) if audio else cfg, proposal=prop, encrypt=getattr(a, "encrypt", False),
                                  backchannel="audio" if audio else "camera", auto_confirm=_auto(a),
                                  confirm=confirm)
     notes = hasattr(end.back, "accept")  # audio: R answers with note tokens, checked by the engine
@@ -283,11 +294,11 @@ def run_receive(a, psk: bytes) -> int:
     cfg = LinkConfig(timeout=a.timeout, retries=a.retries)
     confirm, box = operator_prompt("R")
     end, screen, closers = build_endpoint(a, "r", psk)
-    rcv = box["eng"] = hs.Receiver(psk, a.path, cfg=for_audio(cfg) if audio else cfg, announce=not audio,
+    rcv = box["eng"] = hs.Receiver(psk, a.path, cfg=for_audio(cfg) if audio else cfg, announce=not audio, encrypt=getattr(a, "encrypt", False),
                                    backchannel="audio" if audio else "camera", overwrite=a.overwrite,
                                    auto_confirm=_auto(a), confirm=confirm)
     print(f"Receiver running: point the camera at the sender's screen. Saving to {a.path}. Keys in its window: "
-          "f fullscreen, q quit.")
+          "f fullscreen, q quit. Tip: the sender's code should fill most of the camera view.")
     last: dict = {}
     try:
         while True:
@@ -308,6 +319,10 @@ def run_receive(a, psk: bytes) -> int:
                 last["dbg"] = now
                 print(f"[R] camera: {cam.frames_read} frames, {cam.detections} with a code, "
                       f"{cam.packets_decoded} packets decoded ({cam.diagnostics()})", flush=True)
+                if cam.detections == 0 and cam.frames_read >= 150 and not last.get("hint"):
+                    last["hint"] = True
+                    print("[R] hint: no code seen yet. Aim the camera so the sender's code fills most of the view, "
+                          "keep it in focus, and run the sender fullscreen at full brightness.", flush=True)
             _tick_io(end, screen, now)
             _status(rcv, last, "R")
             if rcv.finished:
@@ -372,10 +387,11 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--path", help="file/folder to send, or destination dir when receiving")
     ap.add_argument("--key-file", help="32-byte key file (or hex text), see `lightferry keygen`")
     ap.add_argument("--key", help="hex key (LEAKS to the process list; prefer --key-file / env LIGHTFERRY_KEY)")
-    ap.add_argument("--open", action="store_true", help="no key: use the public open-mode key (packets are NOT "
-                    "authenticated; local trials only; same as LIGHTFERRY_OPEN=1)")
-    ap.add_argument("--verify", action="store_true", help="open mode only: ask the operator y/N for the 6-digit "
-                    "code (open mode auto-confirms it and just logs the code)")
+    ap.add_argument("--encrypt", action="store_true", help="encrypt and authenticate with a shared key: add "
+                    "--key-file FILE (same file on both machines; create it with `lightferry keygen`)")
+    ap.add_argument("--open", action="store_true", help=argparse.SUPPRESS)  # old name of the default keyless mode
+    ap.add_argument("--verify", action="store_true", help="keyless mode: ask the operator y/N for the 6-digit "
+                    "code (otherwise it is confirmed automatically and just logged); --encrypt always asks")
     ap.add_argument("--passphrase", help="derive the key from a passphrase (>= 12 chars; @FILE reads it from a file; "
                     "prefer env LIGHTFERRY_PASSPHRASE: command-line values leak to the process list)")
     ap.add_argument("--camera", default="webcam", help="webcam | dir:<path> | loop (loop: selftest only)")
@@ -425,7 +441,7 @@ def main(argv=None) -> int:
         sp.add_argument("--open", action="store_true")
         a = sp.parse_args(rest)
         try:
-            key = load_key(a.key_file, a.key, a.passphrase, a.open)
+            key = load_key(a.key_file, a.key, a.passphrase) if (a.key_file or a.key or a.passphrase) else OPEN_PSK
             from . import mobile
         except ImportError as e:
             return _err(f"mobile-serve needs the 'mobile' extra / mobile module: {e}")
@@ -449,10 +465,10 @@ def main(argv=None) -> int:
         a.tiles = parse_tiles(a.tiles)
         if a.yes and a.camera == "webcam":
             return _err("--yes is a test hook: only with --camera dir: (real hardware always asks VERIFY)")
-        psk = load_key(a.key_file, a.key, a.passphrase, a.open)
-        a.auto_verify = psk == OPEN_PSK and not a.verify
-        if psk == OPEN_PSK:
-            print(OPEN_WARNING_VERIFY if a.verify else OPEN_WARNING, file=sys.stderr, flush=True)
+        psk, a.encrypt = resolve_mode(a)
+        a.auto_verify = (not a.encrypt) and not a.verify
+        if not a.encrypt:
+            print(DEFAULT_NOTE, file=sys.stderr, flush=True)
         if a.receive:
             if a.no_camera:
                 return _err("--receive needs a camera")

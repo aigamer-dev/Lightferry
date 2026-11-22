@@ -6,21 +6,23 @@ Lightferry is meant to move data across an air gap while letting the receiver tr
 
 In scope:
 
-- A bystander who can show codes to the receiver's camera, or play sounds, cannot inject data: every packet carries an HMAC-SHA256 tag keyed from the pre-shared key and session nonces.
+- With `--encrypt`: a bystander who can show codes to the receiver's camera, or play sounds, cannot inject data (every packet carries an HMAC-SHA256 tag keyed from the shared key and session nonces), and cannot read it (bodies are encrypted).
 - Replayed or reordered packets are rejected (4096-wide sliding replay window per direction).
-- Packets from a previous session fail the MAC because each session draws fresh nonces.
+- Packets from a previous session are rejected because each session draws fresh nonces (with `--encrypt` they also fail the MAC).
 - Audio replies are keyed tokens bound to the session and the packet they answer. A recorded sender screen replayed later is refused: the receiver keeps used sender nonces in `<dest>/.lightferry-seen` (fails closed with `DEST_NOT_WRITABLE`).
 - Bad audio tokens are rate limited: more than 20 in a minute pauses acceptance.
 - A malicious or corrupted archive cannot write outside the destination.
 
 Out of scope:
 
-- Confidentiality. Data is signed, not encrypted. Anyone who sees the screen or camera feed can read it.
+- In the default mode: confidentiality and authentication (see the table below). Use `--encrypt`.
 - Compromised endpoints, or someone who holds the key.
 - Denial of service: jamming the optical or audio path stops a transfer (it aborts, it does not corrupt).
 - The key's transport. You move it by hand.
 
-## Key handling
+## Key handling (only with --encrypt)
+
+Keys are optional: they are used only when `--encrypt` is given, and a key without `--encrypt` is an error. Encryption is an HMAC-SHA256 keystream with encrypt-then-MAC and per-session keys, standard library only.
 
 - `lightferry keygen` writes 32 random bytes with mode 600 and never overwrites.
 - Keys shorter than 16 bytes are refused.
@@ -31,7 +33,7 @@ Out of scope:
 
 ## VERIFY code
 
-A 6-digit code derived from the session keys and manifest hash. On real hardware the operator compares it by eye and answers y/N on the console (phone server: on-screen buttons); no answer aborts with `VERIFY_TIMEOUT`. Only test channels (`--camera dir:`, `--yes`) confirm automatically, and `--yes` with a real webcam is an error.
+A 6-digit code derived from the session keys and manifest hash. In the default mode it is logged and confirmed automatically; with `--verify` or `--encrypt` the operator compares it by eye and answers y/N on the console (phone server: on-screen buttons); no answer aborts with `VERIFY_TIMEOUT`. Test channels (`--camera dir:`, `--yes`) also confirm automatically, and `--yes` with a real webcam is an error.
 
 In audio mode the sender can only hear a 16-bit token, so it reports success as "unconfirmed"; the receiver's console is authoritative (the archive sha256 is always checked there).
 
@@ -55,8 +57,17 @@ Everything is held in RAM; plan for a few times the transfer size in memory.
 
 Report vulnerabilities privately through the repository's GitHub security advisories.
 
-## Open mode
+## Default mode vs --encrypt
 
-`--open` replaces the shared key with a public constant. It keeps the handshake, nonces, CRC, replay window,
-hash and size checks, but gives up authentication: an observer can inject or replay packets, and the operator
-VERIFY prompt is skipped unless `--verify` is given. It is for local trials only; use a key file otherwise.
+| | Default (no key) | `--encrypt` |
+|---|---|---|
+| Key needed | no | yes, same on both machines |
+| Pairing, session nonces, CRC, replay window, sha256/size checks | yes | yes |
+| Hardened archive extraction | yes | yes |
+| Observer can read the data | yes | no |
+| Observer can inject or replay packets | yes | no |
+| VERIFY | logged, auto-confirmed (`--verify` asks y/N) | operator y/N prompt |
+| Keyless peer vs this mode | `KEY_MISMATCH` | `KEY_MISMATCH` |
+| Intended use | trusted room, quick transfers, local trials | screen or audio visible to others |
+
+The default mode prints a one-line stderr note about this. Use `--encrypt` whenever someone untrusted might see the screen or hear the audio.

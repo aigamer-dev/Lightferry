@@ -178,10 +178,11 @@ class _Engine:
 
     def __init__(self, psk: bytes, cfg: LinkConfig | None, caps: Caps | None, mode: str,
                  confirm: Callable[[str], bool | None] | None, auto_confirm: bool,
-                 rng: Callable[[int], bytes], backchannel: str):
+                 rng: Callable[[int], bytes], backchannel: str, encrypt: bool = False):
         if mode not in ("file", "cmd"):
             raise ValueError("mode must be 'file' or 'cmd'")
         self.psk = psk
+        self.encrypt = bool(encrypt)  # --encrypt: session packet bodies are encrypted with the key
         self.cfg = cfg or LinkConfig()
         self.caps = caps or Caps()
         self.mode = mode
@@ -289,7 +290,7 @@ class _Engine:
             return
         for name, key, win, kk in cands:
             try:
-                pkt = protocol.open_packet(key, raw, win)
+                pkt = protocol.open_packet(key, raw, win, kk.enc_rx(self.ROLE) if (name == "sess" and kk is not None) else None)
             except protocol.ReplayError:
                 self.stats["replay"] += 1
                 self._event(now, "replay", f"ptype={h.ptype} counter={h.counter}")
@@ -414,8 +415,8 @@ class Sender(_Engine):
     def __init__(self, psk: bytes, manifest: dict | None = None, blob: bytes = b"", *, mode: str = "file",
                  cfg: LinkConfig | None = None, caps: Caps | None = None, proposal: Profile | None = None,
                  backchannel: str = "camera", confirm=None, auto_confirm: bool = False,
-                 rng: Callable[[int], bytes] = os.urandom):
-        super().__init__(psk, cfg, caps, mode, confirm, auto_confirm, rng, backchannel)
+                 rng: Callable[[int], bytes] = os.urandom, encrypt: bool = False):
+        super().__init__(psk, cfg, caps, mode, confirm, auto_confirm, rng, backchannel, encrypt)
         if mode == "file" and manifest is None:
             raise ValueError("file mode needs a manifest")
         self.manifest = manifest
@@ -447,7 +448,7 @@ class Sender(_Engine):
         self._car_i, self._car_at, self._car_sealed_at = 0, 0.0, 0.0
         self._heard_frame: list[bytes] = []
         self.expected: dict[bytes, tuple] = {}
-        self._note_keys = (protocol.derive_keys(psk, self.nonce, AUDIO_NONCE_R) if backchannel == "audio"
+        self._note_keys = (protocol.derive_keys(psk, self.nonce, AUDIO_NONCE_R, self.encrypt) if backchannel == "audio"
                            else None)
 
     def _emit(self, packets: list[bytes]) -> None:
@@ -570,7 +571,8 @@ class Sender(_Engine):
         """The same packet (type, fields, body) under the next counter of its own sealer."""
         h = protocol.peek(raw)
         sealer = self._hello_sealer if h.session_id == protocol.NO_SESSION else self._sess_sealer
-        return sealer.seal(h.ptype, raw[protocol.HEADER_LEN:-protocol.TAG_LEN], flags=h.flags, obj_id=h.obj_id,
+        body = protocol.plain_body(raw, sealer.enc_key)
+        return sealer.seal(h.ptype, body, flags=h.flags & ~protocol.FLAG_ENC, obj_id=h.obj_id,
                            seq=h.seq, total=h.total)
 
     # ---- timers
@@ -700,8 +702,8 @@ class Sender(_Engine):
 
     def _authed(self, nonce_r: bytes, prof: Profile, now: float) -> None:
         self._nonce_r = nonce_r
-        self.keys = protocol.derive_keys(self.psk, self.nonce, nonce_r)
-        self._sess_sealer = protocol.Sealer(self.keys.k_s2r, self.keys.session_id)
+        self.keys = protocol.derive_keys(self.psk, self.nonce, nonce_r, self.encrypt)
+        self._sess_sealer = protocol.Sealer(self.keys.k_s2r, self.keys.session_id, enc_key=self.keys.enc_tx(self.ROLE))
         self._win = ReplayWindow()
         self.data_profile = prof
         self._set(AUTHED, now)
@@ -771,8 +773,9 @@ class Receiver(_Engine):
     def __init__(self, psk: bytes, dest: str | os.PathLike | None = None, *, mode: str = "file",
                  cfg: LinkConfig | None = None, caps: Caps | None = None, announce: bool = True,
                  backchannel: str = "camera", check=None, extract=None, overwrite: bool = False,
-                 confirm=None, auto_confirm: bool = False, rng: Callable[[int], bytes] = os.urandom):
-        super().__init__(psk, cfg, caps, mode, confirm, auto_confirm, rng, backchannel)
+                 confirm=None, auto_confirm: bool = False, rng: Callable[[int], bytes] = os.urandom,
+                 encrypt: bool = False):
+        super().__init__(psk, cfg, caps, mode, confirm, auto_confirm, rng, backchannel, encrypt)
         if backchannel == "audio":
             self.nonce = AUDIO_NONCE_R
         self.dest = Path(dest) if dest is not None else None
@@ -1037,15 +1040,15 @@ class Receiver(_Engine):
                 self.warning = "REPLAYED HELLO?"
                 self._event(now, "replay", "audio HELLO with a nonce_S accepted before")
                 return
-            keys = protocol.derive_keys(self.psk, nonce_s, self.nonce)
-            self._adopt({"nonce_s": nonce_s, "keys": keys, "sealer": protocol.Sealer(keys.k_r2s, keys.session_id),
+            keys = protocol.derive_keys(self.psk, nonce_s, self.nonce, self.encrypt)
+            self._adopt({"nonce_s": nonce_s, "keys": keys, "sealer": protocol.Sealer(keys.k_r2s, keys.session_id, enc_key=keys.enc_tx(self.ROLE)),
                          "win": ReplayWindow(), "ack_raw": None, "prof": prof})
             self._set(AUTHED, now)
             return
-        keys = protocol.derive_keys(self.psk, nonce_s, self.nonce)
+        keys = protocol.derive_keys(self.psk, nonce_s, self.nonce, self.encrypt)
         ack_raw = self._hello_seal(PType.HELLO_ACK, protocol.pack_json(
             {"v": PROTO_VERSION, "nonce_s": nonce_s.hex(), "nonce_r": self.nonce.hex(), "profile": prof.to_json()}))
-        c = {"nonce_s": nonce_s, "keys": keys, "sealer": protocol.Sealer(keys.k_r2s, keys.session_id),
+        c = {"nonce_s": nonce_s, "keys": keys, "sealer": protocol.Sealer(keys.k_r2s, keys.session_id, enc_key=keys.enc_tx(self.ROLE)),
              "win": ReplayWindow(), "ack_raw": ack_raw, "prof": prof}
         self._cands.append(c)
         self._select(c)

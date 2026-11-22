@@ -21,32 +21,52 @@ For machines with no internet, download wheels on a connected machine (`pip down
 
 ## First transfer
 
-1. Create a key once and copy it to the other machine by hand (USB, paper, anything not on the network):
+No key and no flag are needed.
 
-    ```bash
-    lightferry keygen --out lightferry.key
-    ```
-
-2. Sanity check without hardware:
+1. Sanity check without hardware:
 
     ```bash
     lightferry selftest
     ```
 
-3. On the receiver (needs a webcam):
+2. On the receiver (needs a webcam):
 
     ```bash
-    lightferry receive --path ./incoming --key-file lightferry.key
+    lightferry --receive --path ./incoming
     ```
 
-4. On the sender, then point the receiver's camera at the sender's screen:
+3. On the sender, then point the receiver's camera at the sender's screen:
 
     ```bash
-    lightferry send --path ./my-folder --key-file lightferry.key
+    lightferry --send --path ./my-folder
     ```
 
-Both windows accept `f` (toggle fullscreen) and `q` (quit). Progress prints as `DATA n/total tiles`. At VERIFY both consoles show a 6-digit code and ask `does the other machine show NNNNNN? [y/N]`. Compare the codes by eye and answer `y`; no answer ends the session with `VERIFY_TIMEOUT`. With `--camera dir:` (two processes on one machine) or `--yes` the code is confirmed automatically; `--yes` with a real webcam is an error.
+Both windows accept `f` (toggle fullscreen) and `q` (quit). Progress prints as `DATA n/total tiles`. In the default mode a one-line note on stderr says the data is not encrypted (anyone who can see the screen can read or inject), and the 6-digit VERIFY code is logged and confirmed automatically. Add `--verify` to be asked `does the other machine show NNNNNN? [y/N]` on both consoles; no answer ends the session with `VERIFY_TIMEOUT`. With `--encrypt` the prompt is always on. `--yes` is a test hook for `--camera dir:` only.
 
-Instead of passing a key every time, set `LIGHTFERRY_KEY=@lightferry.key` (see `.env.example`). If the sender has no camera, use `--no-camera` on the sender and `--backchannel audio` on the receiver; the sender then reports success as "unconfirmed" and the receiver's console has the authoritative result.
+If the sender has no camera, use the audio back-channel; the sender then reports success as "unconfirmed" and the receiver's console has the authoritative result:
+
+```bash
+lightferry --send --path ./my-folder --backchannel audio --no-camera --fullscreen
+lightferry --receive --path ./incoming --backchannel audio
+```
+
+## Optional: encrypt
+
+To keep onlookers from reading or spoofing the transfer, create a key once, carry it to the other machine by hand (USB, paper, anything not on the network), and add `--encrypt --key-file` on both sides:
+
+```bash
+lightferry keygen --out lightferry.key
+lightferry --receive --path ./incoming --encrypt --key-file lightferry.key
+lightferry --send --path ./my-folder --encrypt --key-file lightferry.key
+```
+
+See [Security](security.md) for what each mode protects.
+
+## Tips for a reliable scan
+
+- Aim the receiver's camera so the code fills most of the view, and keep the camera in focus.
+- Run the sender fullscreen at full screen brightness.
+- `LIGHTFERRY_DEBUG=1` prints camera diagnostics and saves undecodable frames.
+- On Windows the camera may need a second try or a moment to lock on.
 
 If tiles keep failing, try fewer or larger codes: `--tiles 1`, `--module-px 8`, or a smaller `--grid 32`. `lightferry bench` suggests a profile for your camera resolution.

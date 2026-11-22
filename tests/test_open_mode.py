@@ -56,13 +56,6 @@ def test_env_open_only_without_explicit_key(monkeypatch, tmp_path):
     assert cli.load_key(str(kf), None) == bytes(range(32))  # an explicit key still wins
 
 
-def test_missing_key_error_points_to_open_mode(monkeypatch):
-    for v in ("LIGHTFERRY_KEY", "LIGHTFERRY_OPEN", "LIGHTFERRY_PASSPHRASE"):
-        monkeypatch.delenv(v, raising=False)
-    with pytest.raises(ValueError, match="--open"):
-        cli.load_key(None, None)
-
-
 def test_open_psk_is_public_and_fixed():
     import hashlib
     assert cli.OPEN_PSK == hashlib.sha256(b"lightferry-open-mode-v1").digest()

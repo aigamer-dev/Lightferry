@@ -9,7 +9,7 @@ def _key(tmp_path):
 
 
 def test_yes_rejected_with_webcam(tmp_path, capsys):
-    rc = cli.main(["send", "--path", str(tmp_path), "--key-file", _key(tmp_path), "--yes"])
+    rc = cli.main(["send", "--path", str(tmp_path), "--encrypt", "--key-file", _key(tmp_path), "--yes"])
     assert rc == 2 and "--yes is a test hook" in capsys.readouterr().err
 
 
@@ -19,7 +19,7 @@ def test_dir_channel_with_audio_backchannel_rejected(tmp_path, capsys):
     for argv in (["send", "--path", str(tmp_path / "f.txt"), "--backchannel", "audio"],
                  ["send", "--path", str(tmp_path / "f.txt"), "--no-camera"],
                  ["receive", "--path", str(tmp_path / "dst"), "--backchannel", "audio"]):
-        assert cli.main([*argv, "--key-file", key, "--camera", ch]) == 2, argv
+        assert cli.main([*argv, "--encrypt", "--key-file", key, "--camera", ch]) == 2, argv
         assert "camera back-channel" in capsys.readouterr().err
 
 

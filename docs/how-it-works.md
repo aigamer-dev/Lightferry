@@ -6,7 +6,7 @@
 |---|---|---|
 | Archive | `archive.py` | deterministic tar, compression, safe unpack |
 | Tiler | `tiler.py` | split bytes into tiles, reassemble, sha256 check |
-| Protocol | `protocol.py` | packet header, HMAC seal, keys, replay window |
+| Protocol | `protocol.py` | packet header, optional encryption and HMAC seal, keys, replay window |
 | Link | `link.py` | stop-and-wait ARQ, profiles, ACK format |
 | Handshake | `handshake.py` | Sender and Receiver state machines |
 | Codec | `codec.py`, `vision.py` | matrix code, frame layout, camera detection |
@@ -26,20 +26,20 @@ The archive is cut into chunks sized to one code's body capacity. Each tile carr
 
 ## Link
 
-Packets are `header(24) | body | HMAC tag(32)`. The sender shows a frame of pending tiles and keeps it up until acknowledged or a timeout fires. An ACK carries the lowest missing sequence plus a 16-bit bitmap of the following tiles, so a frame of several codes is acknowledged in one reply. Retries are bounded (`--retries`).
+Packets are `header(24) | body | tag(32)`. By default the body is plain and the tag is computed with a public constant key, so it detects corruption and cross-session mix-ups but does not authenticate anyone; with `--encrypt` the body is encrypted (HMAC-SHA256 keystream, encrypt-then-MAC) and the tag is an HMAC-SHA256 under secret per-session keys. The sender shows a frame of pending tiles and keeps it up until acknowledged or a timeout fires. An ACK carries the lowest missing sequence plus a 16-bit bitmap of the following tiles, so a frame of several codes is acknowledged in one reply. Retries are bounded (`--retries`).
 
 ## Handshake
 
 States: HELLO, SYNC, VERIFY, READY, START, DATA, DONE, CLOSED (or ABORTED).
 
-1. Both sides prove knowledge of the pre-shared key in HELLO/HELLO_ACK, each with a fresh nonce.
-2. Session keys are derived with HMAC from the key and both nonces; the session id is a hash of the nonces. A packet from another session fails its MAC.
+1. Both sides exchange HELLO/HELLO_ACK, each with a fresh nonce. With `--encrypt` this also proves knowledge of the shared key.
+2. Session keys are derived with HMAC from the key (a public constant in the default mode) and both nonces; the session id is a hash of the nonces. A packet from another session is rejected.
 3. SYNC sends the manifest (names, sizes, sha256, compression). The receiver checks that the destination is writable, has space and that nothing collides.
-4. Both sides display the same 6-digit VERIFY code derived from the session keys and manifest hash. It is confirmed by a person: the CLI asks y/N on the console with a real webcam, and the phone server shows buttons on the screen page (sender) and the phone (receiver). Only test channels (`--camera dir:`, `--yes`, in-process `selftest`) confirm automatically. No answer gives `VERIFY_TIMEOUT`, `n` gives `OPERATOR_REJECT`.
+4. Both sides display the same 6-digit VERIFY code derived from the session keys and manifest hash. It is logged and confirmed automatically in the default mode; with `--verify` or `--encrypt` a person confirms it: the CLI asks y/N on the console with a real webcam, and the phone server shows buttons on the screen page (sender) and the phone (receiver). Test channels (`--camera dir:`, `--yes`, in-process `selftest`) also confirm automatically. No answer gives `VERIFY_TIMEOUT`, `n` gives `OPERATOR_REJECT`.
 5. A profile (grid, module size, tiles) is negotiated, then the sender sends START and the DATA tiles.
 6. The receiver verifies, extracts and sends DONE; the sender answers DONE_ACK and both linger so the last frame stays visible.
 
-Abort reasons include timeouts, `KEY_MISMATCH` (persistent MAC failures show a "KEY MISMATCH?" warning), `NO_COMMON_PROFILE`, `EXISTS` and `NO_SPACE`.
+Abort reasons include timeouts, `KEY_MISMATCH` (a keyless side against an `--encrypt` side, or persistent MAC failures show a "KEY MISMATCH?" warning), `NO_COMMON_PROFILE`, `EXISTS` and `NO_SPACE`.
 
 ## Back-channel
 

@@ -1,21 +1,40 @@
 # Usage
 
 ```
-lightferry {send,receive} --path PATH [options]
+lightferry {--send,--receive} --path PATH [options]
 lightferry {keygen,selftest,bench,mobile-serve} [...]
 ```
 
-The older spellings `--send` and `--receive` still work.
+## Default mode (no key)
 
-## Keys
+Nothing else is needed:
 
-Provide a key with one of:
+```bash
+lightferry --receive --path ./incoming
+lightferry --send --path ./folder
+# sender without a webcam: acoustic back-channel
+lightferry --send --path ./folder --backchannel audio --no-camera --fullscreen
+lightferry --receive --path ./incoming --backchannel audio
+```
+
+The two sides are paired by the on-screen handshake (HELLO/SYNC/START/DONE over the codes, plus the acoustic reply notes), session nonces, CRC, replay window, sha256/size checks and the hardened archive extraction. A one-line stderr note says the data is not encrypted: anyone who can see the screen can read or inject. The 6-digit VERIFY code is logged and confirmed automatically; add `--verify` to be asked y/N. A keyless side cannot talk to an `--encrypt` side (`KEY_MISMATCH`). See [Security](security.md).
+
+## Encryption (optional)
+
+`--encrypt` encrypts and authenticates every session packet body and keeps the y/N VERIFY prompt on. Both machines need the same key, provided with one of:
 
 - `--key-file FILE`: 32 raw bytes, or hex text (what `keygen` writes is raw bytes)
 - `LIGHTFERRY_KEY` environment variable: hex, or `@path` to a key file (`.env.example` uses `LIGHTFERRY_KEY=@lightferry.key`)
 - `--key HEX`: works but leaks into the process list; a warning is printed
+- a shared passphrase (see below)
 
-Keys shorter than 16 bytes are rejected.
+Keys shorter than 16 bytes are rejected. A key without `--encrypt` is an error, and so is `--encrypt` without a key.
+
+```bash
+lightferry keygen --out lightferry.key     # carry the file to the other machine by hand
+lightferry --receive --path ./incoming --encrypt --key-file lightferry.key
+lightferry --send --path ./folder --encrypt --key-file lightferry.key
+```
 
 ## keygen
 
@@ -28,7 +47,7 @@ Writes 32 random bytes with mode 600. Refuses to overwrite an existing file.
 ## send
 
 ```bash
-lightferry send --path ./folder-or-file --key-file lightferry.key
+lightferry --send --path ./folder-or-file
 ```
 
 | Flag | Meaning |
@@ -44,20 +63,29 @@ lightferry send --path ./folder-or-file --key-file lightferry.key
 | `--timeout S` | per-packet timeout seconds (default 1.5) |
 | `--retries N` | retry limit (default 8) |
 | `--compress [auto\|lzma\|zlib\|none]`, `--no-compress` | archive compression (default auto) |
+| `--encrypt` | encrypt and authenticate with a key (see Encryption) |
+| `--verify` | default mode: ask y/N for the VERIFY code instead of auto-confirming |
 | `--fullscreen` | start fullscreen |
 | `--yes` | test hook: auto-confirm VERIFY; only with `--camera dir:` (an error with `webcam`) |
 
-VERIFY: with a real webcam the console prints the code and asks `[y/N]`; `dir:` and `--yes` confirm automatically. `--camera dir:` works only with the camera back-channel: `--backchannel audio` or `--no-camera` with it is rejected. When the audio back-channel is used, the sender ends with `transfer complete (unconfirmed ...)`, since it only heard a 16-bit token.
+VERIFY: in the default mode the code is logged and auto-confirmed; with `--verify` or `--encrypt` and a real webcam the console asks `[y/N]`. `dir:` and `--yes` confirm automatically. `--camera dir:` works only with the camera back-channel: `--backchannel audio` or `--no-camera` with it is rejected. When the audio back-channel is used, the sender ends with `transfer complete (unconfirmed ...)`, since it only heard a 16-bit token.
 
 The grid, module size and tiles are only proposals; the receiver may negotiate a profile both sides support.
 
 ## receive
 
 ```bash
-lightferry receive --path ./incoming --key-file lightferry.key
+lightferry --receive --path ./incoming
 ```
 
 Needs a camera. The item is written to `<path>/<name>`. Existing items are not replaced unless you pass `--overwrite`. Other flags as for `send` (`--camera`, `--camera-index`, `--backchannel camera|audio`, `--timeout`, `--retries`, `--fullscreen`, `--yes`). Use `--backchannel audio` when the sender has no camera: the receiver then plays note tokens from its speaker, and records accepted sender nonces in `<path>/.lightferry-seen` to refuse replays (it aborts with `DEST_NOT_WRITABLE` if it cannot write that file).
+
+## Tips for a reliable scan
+
+- Aim the receiver's camera so the code fills most of the view; keep the camera in focus.
+- Run the sender fullscreen at full screen brightness.
+- `LIGHTFERRY_DEBUG=1` prints camera diagnostics and saves undecodable frames.
+- On Windows the camera may need a second try or a moment to lock on.
 
 ## selftest
 
@@ -82,7 +110,7 @@ lightferry mobile-serve --path PATH [--port 8443] [--host LAN_IP] \
     [--backchannel audio|direct] [--remote-sender] [--out DIR] [--key-file FILE]
 ```
 
-Needs the `mobile` extra. Binds this machine's LAN IP unless `--host` is given. `python -m lightferry.mobile ...` is the same as `lightferry mobile-serve ...`. Set `LIGHTFERRY_DEBUG=1` for per-frame debug output (nothing is dumped to disk). See [Phone test client](phone-test-client.md).
+Needs the `mobile` extra. Binds this machine's LAN IP unless `--host` is given. `python -m lightferry.mobile ...` is the same as `lightferry mobile-serve ...`. It is keyless by default; `--key-file` there gives MAC authentication only (a test tool, no encryption). Set `LIGHTFERRY_DEBUG=1` for per-frame debug output (nothing is dumped to disk). See [Phone test client](phone-test-client.md).
 
 ## Exit codes
 
@@ -92,22 +120,22 @@ Needs the `mobile` extra. Binds this machine's LAN IP unless `--host` is given. 
 
 `lightferry cmd` and `lightferry serve` (a signed command channel) are not implemented. The wire format reserves CMD/RESULT packet types only.
 
-## Keys from a passphrase
+## Keys from a passphrase (with `--encrypt`)
 
-If you do not want to carry a key file between machines, both sides can derive the same 32-byte key from a
+A passphrase is another way to provide the `--encrypt` key. If you do not want to carry a key file between machines, both sides can derive the same 32-byte key from a
 shared passphrase (at least 12 characters) using scrypt with a fixed salt. Type the same phrase on both
 machines yourself; never send it through chat or e-mail.
 
 ```bash
 # Linux/macOS
 export LIGHTFERRY_PASSPHRASE='your shared phrase'
-lightferry --send --path ./folder
+lightferry --send --path ./folder --encrypt
 ```
 
 ```powershell
 # Windows PowerShell
 $env:LIGHTFERRY_PASSPHRASE = 'your shared phrase'
-lightferry --receive --path .\incoming
+lightferry --receive --path .\incoming --encrypt
 ```
 
 - `--passphrase PHRASE` (or `--passphrase @FILE`) does the same, but a command-line value is visible in the
@@ -116,24 +144,3 @@ lightferry --receive --path .\incoming
   `--key` or `--key-file`.
 - A passphrase is weaker than a random key file: anyone who records the codes can try guesses offline. Use a
   long, random phrase.
-
-## Open mode (no key, local trials)
-
-For two machines side by side with no network, you can skip keys entirely:
-
-```bash
-lightferry --send --no-camera --fullscreen --path ./folder --open
-lightferry --receive --path ./incoming --backchannel audio --open
-```
-
-`--open` (or `LIGHTFERRY_OPEN=1`) makes both sides use a fixed, public key. The HELLO/SYNC/START/DONE
-handshake, session nonces, CRC, replay window, SHA-256 and size checks and the hardened archive
-extraction all stay on. What changes:
-
-- Packets are **not authenticated**: anyone who can see the screen or hear the audio can inject or replay.
-- The 6-digit code is only logged and confirmed automatically. Add `--verify` to ask the operator y/N.
-- A keyed side and an open-mode side cannot talk to each other (`KEY_MISMATCH`).
-- `--open` cannot be combined with `--key`, `--key-file` or `--passphrase`. Without any of these, Lightferry
-  refuses to start and points to `--open`; open mode is never switched on silently.
-
-Use `--key-file` (see `lightferry keygen`) for real transfers.

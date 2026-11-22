@@ -32,6 +32,7 @@ OVERHEAD = HEADER_LEN + TAG_LEN  # 56
 LABEL = b"LF1"
 WINDOW = 4096
 FLAG_LAST = 0x01
+FLAG_ENC = 0x02  # body is encrypted (--encrypt): HMAC-SHA256 keystream, then the MAC covers the ciphertext
 NO_SESSION = bytes(8)
 MIN_PSK_LEN = 16
 
@@ -155,6 +156,20 @@ class SessionKeys:
     k_s2r: bytes
     k_r2s: bytes
     k_audio: bytes
+    k_enc_s2r: bytes = b""
+    k_enc_r2s: bytes = b""
+    encrypt: bool = False
+
+    def enc_tx(self, role: str):
+        """Body-encryption key for packets this role sends (None when --encrypt is off)."""
+        if not self.encrypt:
+            return None
+        return self.k_enc_s2r if role == ROLE_S else self.k_enc_r2s
+
+    def enc_rx(self, role: str):
+        if not self.encrypt:
+            return None
+        return self.k_enc_r2s if role == ROLE_S else self.k_enc_s2r
 
     def tx_key(self, role: str) -> bytes:
         return self.k_s2r if role == ROLE_S else self.k_r2s
@@ -163,7 +178,7 @@ class SessionKeys:
         return self.k_r2s if role == ROLE_S else self.k_s2r
 
 
-def derive_keys(psk: bytes, nonce_s: bytes, nonce_r: bytes) -> SessionKeys:
+def derive_keys(psk: bytes, nonce_s: bytes, nonce_r: bytes, encrypt: bool = False) -> SessionKeys:
     """Session keys from the PSK and both fresh nonces; session_id = SHA-256(nonce_S || nonce_R)[:8]."""
     if len(psk) < MIN_PSK_LEN:
         raise ValueError("psk too short")
@@ -171,7 +186,8 @@ def derive_keys(psk: bytes, nonce_s: bytes, nonce_r: bytes) -> SessionKeys:
     k_s2r = _hmac(k_sess, b"lf-s2r")
     k_r2s = _hmac(k_sess, b"lf-r2s")
     return SessionKeys(hashlib.sha256(nonce_s + nonce_r).digest()[:8], k_sess, k_s2r, k_r2s,
-                       _hmac(k_sess, b"lf-audio-tag"))
+                       _hmac(k_sess, b"lf-audio-tag"), _hmac(k_sess, b"lf-enc-s2r"), _hmac(k_sess, b"lf-enc-r2s"),
+                       bool(encrypt))
 
 
 def verify_code(keys: SessionKeys, mode: str, manifest_sha256: bytes | None, nonce_s: bytes,
@@ -189,11 +205,40 @@ def verify_code(keys: SessionKeys, mode: str, manifest_sha256: bytes | None, non
 
 # ---------------------------------------------------------------- seal / open
 
-def seal(key: bytes, hdr: Header, body: bytes) -> bytes:
-    """Serialise and authenticate one packet. The counter in ``hdr`` is used as given."""
+def _crypt(enc_key: bytes, head: bytes, body: bytes) -> bytes:
+    """XOR ``body`` with an HMAC-SHA256 keystream keyed per session and direction; ``head`` (the packed header,
+    unique per packet because it carries the session id and counter) is the nonce. Symmetric."""
+    if not body:
+        return b""
+    out = bytearray()
+    i = 0
+    while len(out) < len(body):
+        out += _hmac(enc_key, b"LF1-enc" + head + i.to_bytes(4, "big"))
+        i += 1
+    n = len(body)
+    return (int.from_bytes(body, "big") ^ int.from_bytes(bytes(out[:n]), "big")).to_bytes(n, "big")
+
+
+def plain_body(raw: bytes, enc_key: bytes | None) -> bytes:
+    """Body of a sealed packet without verifying it (used to re-seal our own cached packets)."""
+    head = raw[:-TAG_LEN]
+    body = head[HEADER_LEN:]
+    if enc_key is not None and (head[1] & FLAG_ENC):
+        body = _crypt(enc_key, head[:HEADER_LEN], body)
+    return body
+
+
+def seal(key: bytes, hdr: Header, body: bytes, enc_key: bytes | None = None) -> bytes:
+    """Serialise and authenticate one packet. The counter in ``hdr`` is used as given. With ``enc_key`` the body is
+    encrypted first (encrypt-then-MAC)."""
     if hdr.ptype not in VALID_PTYPES:
         raise ProtocolError("bad ptype")
-    head = hdr.pack() + bytes(body)
+    if enc_key is not None:
+        hdr = Header(hdr.ptype, hdr.flags | FLAG_ENC, hdr.session_id, hdr.counter, hdr.obj_id, hdr.seq, hdr.total)
+        head0 = hdr.pack()
+        head = head0 + _crypt(enc_key, head0, bytes(body))
+    else:
+        head = hdr.pack() + bytes(body)
     return head + _hmac(key, LABEL + head)
 
 
@@ -240,7 +285,8 @@ class ReplayWindow:
                 self._bits |= 1 << off
 
 
-def open_packet(key: bytes, raw: bytes, window: ReplayWindow | None = None) -> Packet:
+def open_packet(key: bytes, raw: bytes, window: ReplayWindow | None = None,
+                enc_key: bytes | None = None) -> Packet:
     """Verify the MAC (constant time) before parsing, then apply the replay window.
 
     Raises ``AuthError`` (bad MAC / malformed), ``ReplayError`` (below window). A packet whose counter
@@ -255,6 +301,13 @@ def open_packet(key: bytes, raw: bytes, window: ReplayWindow | None = None) -> P
     h = Header.unpack(head)
     if h.ptype not in VALID_PTYPES:
         raise AuthError("bad ptype")
+    body = head[HEADER_LEN:]
+    if enc_key is not None:
+        if not h.flags & FLAG_ENC:
+            raise AuthError("expected an encrypted packet")
+        body = _crypt(enc_key, head[:HEADER_LEN], body)
+    elif h.flags & FLAG_ENC:
+        raise AuthError("encrypted packet but this side has no key")
     dup = False
     if window is not None:
         verdict = window.check(h.counter)
@@ -265,15 +318,16 @@ def open_packet(key: bytes, raw: bytes, window: ReplayWindow | None = None) -> P
         else:
             window.commit(h.counter)
     return Packet(h.ptype, h.flags, h.session_id, h.counter, h.obj_id, h.seq, h.total,
-                  head[HEADER_LEN:], dup)
+                  body, dup)
 
 
 class Sealer:
     """Per-direction sealer: assigns the next counter once per *new* packet. Cache and re-show the
     returned bytes for retransmissions (same counter and tag); never call ``seal`` again for them."""
 
-    def __init__(self, key: bytes, session_id: bytes = NO_SESSION, start: int = 0):
+    def __init__(self, key: bytes, session_id: bytes = NO_SESSION, start: int = 0, enc_key: bytes | None = None):
         self.key = key
+        self.enc_key = enc_key
         self.session_id = session_id
         self.counter = start
 
@@ -283,4 +337,4 @@ class Sealer:
         self.counter += 1
         if self.counter > 0xFFFFFFFF:
             raise ProtocolError("counter exhausted")
-        return seal(self.key, hdr, body)
+        return seal(self.key, hdr, body, self.enc_key)

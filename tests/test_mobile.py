@@ -71,3 +71,87 @@ def test_remote_notes_are_heard_by_the_sender(tmp_path):
         assert snd.hear(heard[0], 1.0) and snd.state == "AUTHED"
     finally:
         back.close()
+
+
+# ---------------------------------------------------------------- server security (PLAN section 12)
+
+def _with_client(tmp_path, fn):
+    aiohttp = pytest.importorskip("aiohttp")
+    from aiohttp.test_utils import TestClient, TestServer
+    from lightferry import mobile
+
+    sess = Session(None, secrets.token_bytes(32), tmp_path / "in", "direct", "tok", remote_sender=True)
+
+    async def run():
+        async with TestClient(TestServer(mobile._build_app(sess))) as c:
+            await fn(c, sess, aiohttp)
+    asyncio.run(run())
+    return sess
+
+
+def test_token_required_on_http_and_ws(tmp_path):
+    async def fn(c, sess, aiohttp):
+        for path in ("/screen", "/m", "/status.json", "/frame.png", "/ws"):
+            r = await c.get(path)
+            assert r.status == 403, path
+            r = await c.get(path + "?t=wrong")
+            assert r.status == 403, path
+        assert (await c.get("/status.json?t=tok")).status == 200
+        with pytest.raises(aiohttp.WSServerHandshakeError) as e:
+            await c.ws_connect("/ws?t=nope")
+        assert e.value.status == 403
+    _with_client(tmp_path, fn)
+
+
+def test_second_websocket_client_refused(tmp_path):
+    async def fn(c, sess, aiohttp):
+        ws1 = await c.ws_connect("/ws?t=tok")
+        with pytest.raises(aiohttp.WSServerHandshakeError) as e:
+            await c.ws_connect("/ws?t=tok")
+        assert e.value.status == 409 and sess.ws is not None and not sess.ws.closed
+        await ws1.close()
+        for _ in range(50):  # the server notices the close, then a new client may connect
+            if sess.ws is None:
+                break
+            await asyncio.sleep(0.02)
+        ws2 = await c.ws_connect("/ws?t=tok")
+        await ws2.close()
+    _with_client(tmp_path, fn)
+
+
+def test_oversize_frame_dropped(tmp_path, monkeypatch):
+    from lightferry import mobile
+    monkeypatch.setattr(mobile, "MAX_JPEG", 1000)
+    seen = []
+    monkeypatch.setattr(Session, "handle_jpeg", lambda self, data: seen.append(len(data)) or [])
+
+    async def fn(c, sess, aiohttp):
+        ws = await c.ws_connect("/ws?t=tok")
+        await ws.send_bytes(b"x" * 500)
+        await ws.send_bytes(b"x" * 5000)  # over the cap: never decoded, the socket is closed
+        for _ in range(50):
+            msg = await ws.receive()
+            if msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                break
+        assert ws.closed or msg.type != aiohttp.WSMsgType.TEXT
+    _with_client(tmp_path, fn)
+    assert seen == [500]
+
+
+def test_cert_is_private_and_fresh(tmp_path):
+    pytest.importorskip("cryptography")
+    import os
+    import stat
+    from lightferry import mobile
+    cert, key, fp = mobile.make_self_signed("192.168.1.20")
+    try:
+        d = key.parent
+        assert stat.S_IMODE(os.stat(d).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(key).st_mode) == 0o600
+        assert d.name.startswith("lightferry-cert-") and len(fp) == 64
+        cert2, key2, fp2 = mobile.make_self_signed("192.168.1.20")
+        assert key2.parent != d and fp2 != fp  # per run, never a cached key
+    finally:
+        import shutil
+        shutil.rmtree(key.parent, ignore_errors=True)
+        shutil.rmtree(key2.parent, ignore_errors=True)

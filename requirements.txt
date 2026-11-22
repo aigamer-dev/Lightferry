@@ -1,7 +1,10 @@
-numpy
-opencv-python
-pytest
-aiohttp
-segno
-cryptography
-build
+# Runtime dependencies, matching pyproject.toml (install the package itself with `pip install .` or the wheel).
+numpy>=1.26
+opencv-python>=4.8
+# extra [audio]: acoustic back-channel
+sounddevice>=0.4
+# extra [mobile]: phone test client (`lightferry mobile-serve`)
+aiohttp>=3.9
+segno>=1.6
+cryptography>=42
+# dev tools (pytest, build) live in the [dev] extra: pip install -e '.[dev]'

@@ -15,8 +15,9 @@ FAST = LinkConfig(timeout=1.0, retries=8)
 
 def make(size=20000, seed=1):
     blob = random.Random(seed).randbytes(size)
-    manifest = {"name": "x.bin", "kind": "file", "files": [{"path": "x.bin", "size": size}],
-                "skipped": [], "archive_size": size, "archive_sha256": hashlib.sha256(blob).hexdigest(),
+    sha = hashlib.sha256(blob).hexdigest()
+    manifest = {"name": "x.bin", "kind": "file", "files": [{"path": "x.bin", "size": size, "sha256": sha}],
+                "dirs": [], "skipped": [], "archive_size": size, "archive_sha256": sha,
                 "compression": "none", "raw_size": size}
     return blob, manifest
 
@@ -434,7 +435,7 @@ def test_real_archive_end_to_end(tmp_path):
     assert s2.abort_reason == "EXISTS"
 
 
-def test_default_manifest_check(tmp_path):
+def test_default_manifest_check(tmp_path, monkeypatch):
     blob, man = make(100)
     assert H.default_manifest_check(man, tmp_path) == "OK"
     (tmp_path / "x.bin").write_bytes(b"1")
@@ -444,14 +445,57 @@ def test_default_manifest_check(tmp_path):
     (tmp_path / "X.BIN").write_bytes(b"1")
     assert H.default_manifest_check(man, tmp_path) == "CASE_COLLISION"
     (tmp_path / "X.BIN").unlink()
-    m2 = dict(man, files=[{"path": "a", "size": 1}, {"path": "A", "size": 1}])
-    assert H.default_manifest_check(m2, tmp_path) == "CASE_COLLISION"
-    assert H.default_manifest_check(dict(man, raw_size=10**18), tmp_path) == "NO_SPACE"
+    f1 = {"path": "a", "size": 1, "sha256": "0" * 64}
+    m2 = dict(man, kind="dir", files=[f1, dict(f1, path="A")])
+    assert H.default_manifest_check(m2, tmp_path) == "BAD_MANIFEST"  # colliding own entries
+    assert H.default_manifest_check(dict(man, kind="dir", files=[f1]), tmp_path) == "OK"
+    import shutil
+    monkeypatch.setattr(shutil, "disk_usage", lambda p: shutil._ntuple_diskusage(10, 10, 10))
+    assert H.default_manifest_check(man, tmp_path) == "NO_SPACE"
+    monkeypatch.undo()
     assert H.default_manifest_check({"name": "x"}, tmp_path) == "BAD_MANIFEST"
     assert H.default_manifest_check(dict(man, compression="rar"), tmp_path) == "BAD_MANIFEST"
     f = tmp_path / "file"
     f.write_bytes(b"")
     assert H.default_manifest_check(man, f / "sub") == "DEST_NOT_WRITABLE"
+
+
+def test_sync_check_uses_the_extract_size_limit(tmp_path):
+    """SYNC must refuse what unpack() would refuse after the whole transfer (archive.DEFAULT_MAX_BYTES)."""
+    from lightferry import archive
+    blob, man = make(100)
+    big = archive.DEFAULT_MAX_BYTES + 1
+    huge = dict(man, raw_size=big, files=[dict(man["files"][0], size=big)])
+    assert H.default_manifest_check(huge, tmp_path) == "BAD_MANIFEST"
+    assert H.default_manifest_check(dict(man, archive_size=big), tmp_path) == "BAD_MANIFEST"
+    assert H.default_manifest_check(man, tmp_path, max_bytes=99) == "BAD_MANIFEST"
+    assert H.default_manifest_check(man, tmp_path, max_bytes=100) == "OK"
+
+
+def _authed_pair():
+    """S and R (camera back-channel) right after HELLO / HELLO_ACK, plus a sealer with R's session key."""
+    blob, s, r, ch, clock, rec = setup()
+    hello = s.step(0.0, [])
+    s.step(0.1, r.step(0.0, hello))
+    assert s.state == H.AUTHED
+    return s, P.Sealer(s.keys.k_r2s, s.keys.session_id)
+
+
+@pytest.mark.parametrize("body", [b"[1,2]", b'"str"', b"7", b"null", b"{}"])
+def test_malformed_sync_ack_aborts_cleanly(body):
+    s, seal = _authed_pair()
+    s.step(0.2, [seal.seal(P.PType.SYNC_ACK, body)])
+    assert s.state == H.ABORTED and s.abort_reason == "BAD_SYNC_ACK"
+
+
+@pytest.mark.parametrize("body", [b"[1,2]", b'"x"', b"null"])
+def test_malformed_abort_and_done_bodies(body):
+    s, seal = _authed_pair()
+    s.step(0.2, [seal.seal(P.PType.ABORT, body)])
+    assert s.state == H.ABORTED and s.abort_reason == "PEER:?"
+    s, seal = _authed_pair()
+    s._on_done(P.open_packet(s.keys.k_r2s, seal.seal(P.PType.DONE, body), P.ReplayWindow()), 0.3)
+    assert s.state == H.CLOSED and s.result == {"status": "BAD_DONE"}
 
 
 def test_negotiate():

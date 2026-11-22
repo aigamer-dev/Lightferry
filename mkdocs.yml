@@ -1,0 +1,39 @@
+site_name: Lightferry
+site_description: Visual sneakernet - move files between air-gapped machines with a screen and a webcam.
+site_url: https://lightferry.aigamer.dev
+repo_url: https://github.com/aigamer-dev/Lightferry
+repo_name: aigamer-dev/Lightferry
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+  features:
+    - navigation.sections
+    - content.code.copy
+nav:
+  - Home: index.md
+  - Getting started: getting-started.md
+  - Usage: usage.md
+  - How it works: how-it-works.md
+  - Security: security.md
+  - Phone test client: phone-test-client.md
+  - Development: development.md
+  - Changelog: changelog.md
+exclude_docs: |
+  PLAN.md
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences

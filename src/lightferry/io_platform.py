@@ -14,6 +14,7 @@ the session's R->S key, it names the S packet it answers), played as 4 notes aft
 from __future__ import annotations
 
 import queue
+import sys
 import shutil
 import subprocess
 import threading
@@ -298,6 +299,7 @@ class AudioBack(BackChannel):
     # S
     def _listen_loop(self) -> None:
         lst = self.ac.NoteListener(self.fs, repeat=self.repeat, accept=lambda t: self.accept(t))
+        limited = False
         while not self._stop.is_set():
             try:
                 x = self._audio.get(timeout=0.2)
@@ -305,6 +307,10 @@ class AudioBack(BackChannel):
                 continue
             for t in lst.feed(x):
                 self._in.put(t)
+            if lst.limited != limited:  # PLAN 11: log the rate limit, ignore tokens while it lasts
+                limited = lst.limited
+                print("\nwarning: many unexpected audio tokens in the last minute; ignoring audio for now"
+                      if limited else "\naudio rate limit lifted", file=sys.stderr, flush=True)
 
     def recv(self, timeout_s: float = 0.0):
         try:

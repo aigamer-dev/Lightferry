@@ -13,15 +13,15 @@ Both are tick driven and never block or touch a transport::
   A finished Sender must keep being stepped until the peer is done so it can re-answer a repeated DONE.
   Keep the last ABORT/DONE_ACK frame shown for ``linger_s``.
 * VERIFY: ``engine.verify_code`` is set; answer via ``confirm(code) -> bool | None`` (called once;
-  None = pending), ``engine.operator_answer(ok)``, or ``auto_confirm=True``. The CLI and phone server
-  auto-confirm: the code follows from the session keys and the manifest sha, which every MAC and the SYNC_ACK
-  already check, so a mismatch never reaches VERIFY.
+  None = pending), ``engine.operator_answer(ok)``, or ``auto_confirm=True``. The CLI asks the operator on
+  real hardware and auto-confirms only for test channels (``dir:``/``loop``/``--yes``); the phone server asks
+  on its pages.
 * Observability: ``state``, ``history``, ``abort_reason``, ``warning`` ("KEY MISMATCH?" while MAC
   failures persist), ``result``, ``progress``, ``stats``, ``events``.
 
 Abort reasons: HELLO_TIMEOUT SYNC_TIMEOUT VERIFY_TIMEOUT DONE_TIMEOUT IDLE_TIMEOUT RETRIES_EXHAUSTED
 KEY_MISMATCH ROLE_COLLISION MODE_MISMATCH MANIFEST_MISMATCH OPERATOR_REJECT NO_COMMON_PROFILE BAD_PROFILE
-BAD_HELLO CMD_UNSUPPORTED, the SYNC_ACK statuses (DEST_NOT_WRITABLE NO_SPACE EXISTS CASE_COLLISION
+BAD_HELLO BAD_SYNC_ACK CMD_UNSUPPORTED, the SYNC_ACK statuses (DEST_NOT_WRITABLE NO_SPACE EXISTS CASE_COLLISION
 PATH_TOO_LONG BAD_MANIFEST) and ``PEER:<reason>`` when the peer aborted.
 """
 from __future__ import annotations
@@ -32,7 +32,7 @@ import hmac
 import os
 import shutil
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -56,6 +56,11 @@ STATUS_OK = "OK"
 
 # ---- audio back-channel: R answers with 2-byte note tokens instead of packets
 AUDIO_NONCE_R = bytes(16)  # R sends no nonce over audio: keys come from the PSK and S's fresh nonce
+# ...so R itself must refuse a nonce_S it accepted before (a recorded S screen replayed later): the used nonces
+# are kept in <dest>/SEEN_FILE (mode 600, the newest SEEN_MAX)
+SEEN_FILE = ".lightferry-seen"
+SEEN_MAX = 4096
+NOTE_GRACE_S = 2.0  # S: tokens for the previous cycle's codes stay valid this long after a re-sign
 OK, SYNC_OK, DONE_OK, DONE_FAIL = b"ok", b"sync", b"done", b"fail"
 # R speaks three times per transfer: HELLO seen, manifest complete, archive done. The manifest and the data
 # (START first) cycle on screen meanwhile; a done token may answer a resealed START as well as a DATA tile.
@@ -76,21 +81,13 @@ class HandoffError(Exception):
         self.reason = reason
 
 
-def _lzma_ok() -> bool:
-    try:
-        import lzma  # noqa: F401
-        return True
-    except ImportError:  # pragma: no cover
-        return False
-
-
 @dataclass
 class Caps:
     """What a side supports (sent in HELLO). ``compress`` lists archive compressions it can unpack."""
     grids: tuple = (32, 64, 96, 128, 177)
     module_px: tuple = (2, 3, 4, 6, 8)
     tiles: tuple = (1, 2, 3, 4)
-    compress: tuple = field(default_factory=lambda: ("none", "zlib") + (("lzma",) if _lzma_ok() else ()))
+    compress: tuple = ("none", "zlib", "lzma")  # archive.py needs lzma, so every side unpacks all three
     max_res: tuple | None = None
 
     def to_json(self) -> dict:
@@ -127,28 +124,22 @@ def manifest_bytes(manifest: dict) -> bytes:
 # ---------------------------------------------------------------- receiver-side manifest checks
 
 def default_manifest_check(manifest: dict, dest: Path, overwrite: bool = False,
-                           compress: tuple = ("none", "zlib", "lzma")) -> str:
+                           compress: tuple = ("none", "zlib", "lzma"), max_bytes: int | None = None) -> str:
     """Return a SYNC_ACK status: OK | BAD_MANIFEST | DEST_NOT_WRITABLE | NO_SPACE | EXISTS |
-    CASE_COLLISION | PATH_TOO_LONG (PLAN section 6 step 3)."""
+    CASE_COLLISION | PATH_TOO_LONG (PLAN section 6 step 3). ``max_bytes`` must match what the extract step
+    allows (default ``archive.DEFAULT_MAX_BYTES``), so a manifest accepted here is never refused after the data.
+    Collisions among the manifest's own entries are already BAD_MANIFEST (``archive.parse_manifest``)."""
     from . import archive
     try:
-        archive.parse_manifest(manifest, 2 ** 63)
+        archive.parse_manifest(manifest, archive.DEFAULT_MAX_BYTES if max_bytes is None else max_bytes)
     except archive.ArchiveError:
         return "BAD_MANIFEST"
     except (KeyError, TypeError, ValueError, AttributeError, OverflowError):
         return "BAD_MANIFEST"
-    try:
-        name = manifest["name"]
-        files = manifest["files"]
-        a_size, raw = int(manifest["archive_size"]), int(manifest["raw_size"])
-        sha = manifest["archive_sha256"]
-        if not (isinstance(name, str) and name and manifest["kind"] in ("file", "dir")
-                and isinstance(files, list) and isinstance(sha, str) and len(bytes.fromhex(sha)) == 32
-                and manifest["compression"] in compress and a_size >= 0 and raw >= 0
-                and all(isinstance(f["path"], str) for f in files)):
-            return "BAD_MANIFEST"
-    except (KeyError, TypeError, ValueError):
+    if manifest["compression"] not in compress:
         return "BAD_MANIFEST"
+    name, files = manifest["name"], manifest["files"]
+    a_size, raw = manifest["archive_size"], manifest["raw_size"]
     dest = Path(dest)
     try:
         dest.mkdir(parents=True, exist_ok=True)
@@ -157,12 +148,6 @@ def default_manifest_check(manifest: dict, dest: Path, overwrite: bool = False,
         probe.unlink()
     except OSError:
         return "DEST_NOT_WRITABLE"
-    seen = set()
-    for f in files:
-        k = unicodedata.normalize("NFC", f["path"]).casefold()
-        if k in seen:
-            return "CASE_COLLISION"
-        seen.add(k)
     if os.name == "nt" and files and len(str(dest)) + 1 + len(name) + max(len(f["path"]) for f in files) >= 260:
         return "PATH_TOO_LONG"
     key = unicodedata.normalize("NFC", name).casefold()
@@ -289,9 +274,10 @@ class _Engine:
 
     def _echoes_me(self, pkt: Packet) -> bool:
         try:
-            return pkt.json().get("nonce") == self.nonce.hex()
-        except (protocol.ProtocolError, AttributeError):
+            d = pkt.json()
+        except protocol.ProtocolError:
             return False
+        return isinstance(d, dict) and d.get("nonce") == self.nonce.hex()
 
     def _on_raw(self, raw: bytes, now: float) -> None:
         h = protocol.peek(raw)
@@ -408,7 +394,8 @@ class _Engine:
 
     def _on_peer_abort(self, pkt: Packet, now: float) -> None:
         try:
-            reason = str(pkt.json().get("reason", "?"))
+            d = pkt.json()
+            reason = str(d.get("reason", "?")) if isinstance(d, dict) else "?"
         except protocol.ProtocolError:
             reason = "?"
         self._abort(now, reason, notify=False, peer=True)
@@ -451,8 +438,9 @@ class Sender(_Engine):
         self._done_ack_raw: bytes | None = None
         self._showing: list[bytes] = []  # the frame on screen now
         self._showing_at = 0.0
-        # audio: (ptype, counter, obj_id, seq) of recently shown packets and the note tokens R may answer them with
-        self._asked: collections.deque = collections.deque(maxlen=64)
+        # audio: (shown_at, [(note token, (kind, ptype, obj_id, seq))]) per recently shown packet
+        self._shown_log: collections.deque = collections.deque(maxlen=64)
+        self._cycle_at = 0.0  # audio: when the codes on screen were last (re)signed
         self._car: list[bytes] = []  # audio: the codes cycling on screen (manifest, or START + data)
         self._car_tx: TileTx | None = None
         self._car_lead: list[bytes] = []
@@ -476,7 +464,7 @@ class Sender(_Engine):
             self._set(HELLO, now)
             self._hello_raw = self._hello_seal(
                 PType.HELLO, self._hello_body({"proposal": self.proposal.to_json()}))
-            self._frame, self._shown_at = [self._hello_raw], now
+            self._frame, self._shown_at, self._cycle_at = [self._hello_raw], now, now
         for raw in inbound:
             self._on_raw(raw, now)
         if self.state not in (ABORTED, CLOSED):
@@ -491,13 +479,14 @@ class Sender(_Engine):
             if (not frame and self._showing and self.state not in (AUTHED, DATA)
                     and now - max(self.last_valid, self._showing_at) >= self.cfg.timeout):
                 frame = [self._reseal(p) for p in self._showing]
+                self._cycle_at = now
         if frame:
             self._showing, self._showing_at = frame, now
             if self._note_keys is not None:
                 for p in frame:
-                    h = protocol.peek(p)
-                    self._asked.append((h.ptype, h.counter, h.obj_id, h.seq))
-                self._refresh_expected()
+                    self._log_shown(p, now)
+        if self._note_keys is not None:
+            self._refresh_expected(now)
         return frame
 
     # ---- audio: cycle an object's codes on screen until R's one note says it has them all
@@ -513,6 +502,7 @@ class Sender(_Engine):
         self._car_lead = [self._reseal(p) if self._car else p for p in self._car_lead]
         self._car = self._car_lead + tx._packets(list(range(tx.total)))
         self._car_i, self._car_at, self._car_sealed_at = 0, -1e18, now
+        self._cycle_at = now
 
     def _car_tick(self, now: float) -> None:
         if now - self._car_at < self.cfg.dwell_s:
@@ -525,17 +515,31 @@ class Sender(_Engine):
         self.profile = BOOTSTRAP if i < len(self._car_lead) or self.state == AUTHED else self.data_profile
         self._frame, self._car_i, self._car_at = [self._car[i]], i + 1, now
 
-    def _refresh_expected(self) -> None:
+    def _log_shown(self, raw: bytes, now: float) -> None:
+        h = protocol.peek(raw)
+        toks = []
+        for kind in _NOTE_KINDS.get(h.ptype, ()):
+            extra = self.manifest_sha if kind == SYNC_OK else b""
+            toks.append((note_token(self._note_keys, kind, h.ptype, h.counter, extra), (kind, h.ptype, h.obj_id, h.seq)))
+        self._shown_log.append((now, toks))
+
+    def _refresh_expected(self, now: float) -> None:
+        """Valid tokens: answers that fit the current state, for codes of the latest cycle (plus a short grace
+        for the cycle before a re-sign) shown within the last timeout. A 16-bit token is guessable, so the
+        fewer are valid at once, the lower the odds that noise or a forger hits one (PLAN section 11)."""
+        kinds = {HELLO: (OK,), AUTHED: (SYNC_OK,), DATA: (DONE_OK, DONE_FAIL)}.get(self.state, ())
+        t0 = max(self._cycle_at - NOTE_GRACE_S, now - self.cfg.timeout)
         exp = {}
-        for pt, ctr, obj, seq in self._asked:
-            for kind in _NOTE_KINDS.get(pt, ()):
-                extra = self.manifest_sha if kind == SYNC_OK else b""
-                exp[note_token(self._note_keys, kind, pt, ctr, extra)] = (kind, pt, obj, seq)
+        if kinds and not self.finished:
+            for at, toks in self._shown_log:
+                if at >= t0:
+                    exp.update((t, e) for t, e in toks if e[0] in kinds)
         self.expected = exp
 
     def hear(self, token: bytes, now: float) -> bool:
         """Audio: a note token heard from R. Returns False (and does nothing) unless it answers a packet this
-        engine showed recently. ``expected`` holds the valid tokens, for the listener's noise filter."""
+        engine showed recently. ``expected`` holds the valid tokens, for the listener's noise filter.
+        A heard token is all S learns, so an audio-mode ``result`` carries ``"confirmed": False``."""
         e = self.expected.get(token)
         if e is None or self.finished:
             return False
@@ -551,13 +555,15 @@ class Sender(_Engine):
             self._sync_ok(now)
         elif kind in (DONE_OK, DONE_FAIL) and st == DATA:
             self._tx_d.on_ack(self._tx_d.total, 0, 0)
-            self.result = {"status": STATUS_OK if kind == DONE_OK else "FAILED", "sha256_ok": kind == DONE_OK}
+            self.result = {"status": STATUS_OK if kind == DONE_OK else "FAILED", "sha256_ok": kind == DONE_OK,
+                           "confirmed": False}  # a 16-bit token, not a sealed DONE: S cannot be sure
             self._done_ack_raw = self._sess_seal(PType.DONE_ACK, b"")
             self._heard_frame = [self._done_ack_raw]
             if kind == DONE_OK:
                 self._set(CLOSED, now)
             else:
                 self._abort(now, "TRANSFER_FAILED", notify=False, peer=True)
+        self._refresh_expected(now)
         return True
 
     def _reseal(self, raw: bytes) -> bytes:
@@ -716,9 +722,11 @@ class Sender(_Engine):
     def _on_sync_ack(self, pkt: Packet, now: float) -> None:
         try:
             d = pkt.json()
+            if not isinstance(d, dict):
+                raise protocol.ProtocolError("SYNC_ACK body is not an object")
             echo, status = str(d["sha"]), str(d["status"])
         except (KeyError, protocol.ProtocolError):
-            return
+            return self._abort(now, "BAD_SYNC_ACK")  # authenticated but malformed: R is broken, stop cleanly
         mine = self.manifest_sha.hex()
         if len(echo) < 16 or not mine.startswith(echo):
             return self._abort(now, "MANIFEST_MISMATCH")
@@ -741,6 +749,8 @@ class Sender(_Engine):
         try:
             self.result = pkt.json()
         except protocol.ProtocolError:
+            self.result = None
+        if not isinstance(self.result, dict):
             self.result = {"status": "BAD_DONE"}
         self._done_ack_raw = self._sess_seal(PType.DONE_ACK, b"")
         self._frame = [self._done_ack_raw]
@@ -787,6 +797,7 @@ class Receiver(_Engine):
         self._tries = 0
         self._cands: list[dict] = []  # HELLO_ACKED candidate sessions
         self._expect_total: int | None = None
+        self._seen_mem: set[str] = set()  # used nonce_S values when there is no dest to persist them in
 
     def _emit(self, packets: list[bytes]) -> None:
         self._out.extend(packets)
@@ -852,7 +863,7 @@ class Receiver(_Engine):
         pt, ctr = self._fresh
         if pt == PType.HELLO:
             return note_token(self.keys, OK, pt, ctr)
-        if self.state in (VERIFY, READY) and pt == PType.SYNC:
+        if self.state == READY and pt == PType.SYNC:  # manifest complete and R's operator said y
             return note_token(self.keys, SYNC_OK, pt, ctr, self.manifest_sha)
         if self.state == DONE and pt in (PType.DATA, PType.START):
             return note_token(self.keys, DONE_OK if self.result["ok"] else DONE_FAIL, pt, ctr)
@@ -1017,6 +1028,15 @@ class Receiver(_Engine):
         if self.backchannel == "audio":  # no HELLO_ACK: S's proposal is the profile, keys need no R nonce
             if prof != proposal:
                 return self._abort(now, "BAD_PROFILE") if strict else None
+            try:
+                fresh = self._claim_nonce(nonce_s)
+            except OSError:
+                return self._abort(now, "DEST_NOT_WRITABLE")  # can't record it: accepting would allow replays
+            if not fresh:  # keys depend on nonce_S alone: a reused one is a recorded session played again
+                self.stats["replay"] += 1
+                self.warning = "REPLAYED HELLO?"
+                self._event(now, "replay", "audio HELLO with a nonce_S accepted before")
+                return
             keys = protocol.derive_keys(self.psk, nonce_s, self.nonce)
             self._adopt({"nonce_s": nonce_s, "keys": keys, "sealer": protocol.Sealer(keys.k_r2s, keys.session_id),
                          "win": ReplayWindow(), "ack_raw": None, "prof": prof})
@@ -1032,6 +1052,32 @@ class Receiver(_Engine):
         if self.state == HELLO:
             self._set(HELLO_ACKED, now)
         self._send_timed("hello_ack", [x["ack_raw"] for x in self._cands], now, force=True)
+
+    def _claim_nonce(self, nonce_s: bytes) -> bool:
+        """Audio mode: record nonce_S as used. False if it was accepted before (this engine or, through
+        ``<dest>/SEEN_FILE``, an earlier receiver on the same dest). Raises OSError if it can't be recorded."""
+        h = nonce_s.hex()
+        if self.dest is None:  # no folder to persist into (tests with an injected extract)
+            if h in self._seen_mem:
+                return False
+            self._seen_mem.add(h)
+            return True
+        self.dest.mkdir(parents=True, exist_ok=True)
+        path = self.dest / SEEN_FILE
+        try:
+            seen = path.read_text("ascii").split()
+        except FileNotFoundError:
+            seen = []
+        except UnicodeDecodeError:
+            seen = []  # damaged: start over rather than refuse every sender
+        if h in seen:
+            return False
+        tmp = path.with_name(f"{SEEN_FILE}.{os.getpid()}.tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as f:
+            f.write("\n".join((seen + [h])[-SEEN_MAX:]) + "\n")
+        os.replace(tmp, path)
+        return True
 
     def _manifest_done(self, now: float) -> None:
         raw = self._rx_m.assemble()

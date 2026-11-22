@@ -3,8 +3,13 @@
 This machine is the SENDER (handshake.Sender over archive.pack(path)). A phone is the RECEIVER's camera,
 speaker and buttons; all Receiver logic (decode, keys, unpack) runs here, the phone never holds the key.
 
-    python -m lightferry.mobile PATH --key SECRET [--port 8443] [--out DIR] [--backchannel audio|direct]
-    lightferry.mobile.serve(path, key, host='0.0.0.0', port=8443, out_dir=None, backchannel='audio')
+    lightferry mobile-serve --path PATH [--key-file F] [--host LAN_IP] [--port 8443] [--out DIR] [--remote-sender]
+    python -m lightferry.mobile ...     (same as `lightferry mobile-serve ...`)
+    lightferry.mobile.serve(path, key, host=None, port=8443, out_dir=None, backchannel='audio')
+
+Security (PLAN section 12): binds the LAN interface only (``lan_ip()`` unless ``--host``), one WebSocket
+client at a time, a fresh self-signed cert per run in a private temp dir, token on every request. Both VERIFY
+codes are confirmed by hand on the pages (screen = S, phone = R).
 
 Back-channel
   audio : each receiver reply is a 2-byte note token (handshake.note_token), played by the phone (WebAudio)
@@ -18,16 +23,15 @@ Remote sender (``--remote-sender``)
 """
 from __future__ import annotations
 
-import argparse
 import asyncio
 import collections
 import datetime as _dt
-import hashlib
 import hmac
 import ipaddress
 import json
 import os
 import secrets
+import shutil
 import socket
 import ssl
 import subprocess
@@ -39,7 +43,6 @@ from pathlib import Path
 
 import numpy as np
 
-from . import io_platform
 
 STATIC = Path(__file__).parent / "mobile_static"
 FS = 48000
@@ -63,36 +66,37 @@ def lan_ip() -> str:
 
 
 def make_self_signed(host: str, out_dir: Path | None = None) -> tuple[Path, Path, str]:
-    """Self-signed cert (SAN: host, localhost, 127.0.0.1) cached under a temp dir -> (cert, key, sha256 hex)."""
+    """A new self-signed cert (SAN: host, localhost, 127.0.0.1) -> (cert, key, sha256 hex). Without ``out_dir``
+    it goes into a fresh private dir (``mkdtemp``, 0700) that the caller removes; the key file is created 0600
+    before anything is written to it, and never reused."""
     from cryptography import x509
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import ec
     from cryptography.x509.oid import NameOID
 
-    out_dir = Path(out_dir or Path(tempfile.gettempdir()) / "lightferry-mobile-cert")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    tag = hashlib.sha256(host.encode()).hexdigest()[:8]
-    cp, kp = out_dir / f"cert-{tag}.pem", out_dir / f"key-{tag}.pem"
-    if not (cp.exists() and kp.exists()):
-        key = ec.generate_private_key(ec.SECP256R1())
-        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "lightferry-mobile-test")])
-        sans = [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
-        try:
-            sans.append(x509.IPAddress(ipaddress.ip_address(host)))
-        except ValueError:
-            sans.append(x509.DNSName(host))
-        now = _dt.datetime.now(_dt.timezone.utc)
-        cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
-                .serial_number(x509.random_serial_number()).not_valid_before(now - _dt.timedelta(days=1))
-                .not_valid_after(now + _dt.timedelta(days=30))
-                .add_extension(x509.SubjectAlternativeName(sans), critical=False)
-                .sign(key, hashes.SHA256()))
-        cp.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-        kp.write_bytes(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                                         serialization.NoEncryption()))
-        os.chmod(kp, 0o600)
-    from cryptography import x509 as _x
-    cert = _x.load_pem_x509_certificate(cp.read_bytes())
+    out_dir = Path(out_dir) if out_dir else Path(tempfile.mkdtemp(prefix="lightferry-cert-"))
+    out_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    cp, kp = out_dir / "cert.pem", out_dir / "key.pem"
+    for p in (cp, kp):
+        p.unlink(missing_ok=True)
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "lightferry-mobile-test")])
+    sans = [x509.DNSName("localhost"), x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]
+    try:
+        sans.append(x509.IPAddress(ipaddress.ip_address(host)))
+    except ValueError:
+        sans.append(x509.DNSName(host))
+    now = _dt.datetime.now(_dt.timezone.utc)
+    cert = (x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(key.public_key())
+            .serial_number(x509.random_serial_number()).not_valid_before(now - _dt.timedelta(days=1))
+            .not_valid_after(now + _dt.timedelta(days=2))
+            .add_extension(x509.SubjectAlternativeName(sans), critical=False)
+            .sign(key, hashes.SHA256()))
+    cp.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    fd = os.open(kp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(key.private_bytes(serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+                                  serialization.NoEncryption()))
     return cp, kp, cert.fingerprint(hashes.SHA256()).hex()
 
 
@@ -166,8 +170,6 @@ class Mic:
 class Session:
     def __init__(self, path, key: bytes, out_dir, backchannel: str, token: str, remote_sender: bool = False):
         import cv2
-        from . import archive, handshake
-        from .link import LinkConfig, Profile
 
         self.cv2 = cv2
         self.path = path
@@ -211,9 +213,9 @@ class Session:
         if not self.remote:
             blob, manifest = archive.pack(self.path)
             sender = handshake.Sender(self.key, manifest, blob, backchannel=self.backchannel, cfg=cfg,
-                                      proposal=Profile(64, 10, 2), auto_confirm=True)
+                                      proposal=Profile(64, 10, 2))  # VERIFY: the screen page's buttons
         receiver = handshake.Receiver(self.key, self.dest, backchannel=self.backchannel, announce=False,
-                                      cfg=cfg, auto_confirm=True)
+                                      cfg=cfg)  # VERIFY: the phone's buttons
         with self.rlock:
             self.gen += 1
             self.s_inbound.clear()
@@ -271,17 +273,8 @@ class Session:
         if img is not None:
             self.nframes = getattr(self, "nframes", 0) + 1
             t0 = time.monotonic()
-            if self.nframes % 5 == 1:  # debug: keep a sample of what the phone really sees
-                try:
-                    os.makedirs("out/debug", exist_ok=True)
-                    with open("out/debug/last.jpg", "wb") as fh:
-                        fh.write(data)
-                except OSError:
-                    pass
             warped = vision.detect_frame(img)
             self.detected = warped is not None
-            if warped is not None:
-                self.cv2.imwrite("out/debug/warped.png", warped)
             if warped is not None:
                 with self.rlock:
                     profiles = self.receiver.decode_profiles if self.receiver else []
@@ -290,10 +283,11 @@ class Session:
                     if packets:
                         break
             self.tiles = len(packets)
-            from .protocol import PType, peek
-            kinds = ",".join(PType(peek(p).ptype).name for p in packets)
-            print(f"[phone] frame#{self.nframes} detect={'yes' if warped is not None else 'no'} [{kinds}] "
-                  f"R={self.receiver.state if self.receiver else '-'} {time.monotonic()-t0:.2f}s", flush=True)
+            if os.environ.get("LIGHTFERRY_DEBUG") == "1":
+                from .protocol import PType, peek
+                kinds = ",".join(PType(peek(p).ptype).name for p in packets)
+                print(f"[phone] frame#{self.nframes} detect={'yes' if warped is not None else 'no'} [{kinds}] "
+                      f"R={self.receiver.state if self.receiver else '-'} {time.monotonic()-t0:.2f}s", flush=True)
         return self.receiver_step(packets)
 
     def dispatch(self, out: list[bytes]) -> None:
@@ -462,9 +456,15 @@ def _build_app(sess: Session):
         return web.FileResponse(p)
 
     async def ws_handler(req):
+        if sess.ws is not None and not sess.ws.closed:  # one client: never hand the session to a second one
+            return web.Response(status=409, text="another client is connected")
         ws = web.WebSocketResponse(max_msg_size=MAX_JPEG, heartbeat=20)
-        await ws.prepare(req)
-        sess.ws = ws
+        sess.ws = ws  # claimed before the handshake's await, so two racing clients can't both get in
+        try:
+            await ws.prepare(req)
+        except Exception:
+            sess.ws = None
+            raise
         loop = asyncio.get_running_loop()
         busy = False
         push = asyncio.create_task(_push(ws))
@@ -558,15 +558,16 @@ async def _main(path, key, host, port, out_dir, backchannel, stop_after, remote_
             sess.backchannel = "direct"
             sess.banner = f"Mic unavailable ({e}); using DIRECT back-channel (test shortcut)."
             print("WARNING:", sess.banner)
-    ip = lan_ip()
+    ip = host or lan_ip()  # PLAN 12: the LAN interface only, not 0.0.0.0
     cert, keyf, fp = make_self_signed(ip)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(cert, keyf)
+    shutil.rmtree(cert.parent, ignore_errors=True)  # loaded: nothing of the key stays on disk
     runner = web.AppRunner(_build_app(sess))
     await runner.setup()
-    await web.TCPSite(runner, host, port, ssl_context=ctx).start()
+    await web.TCPSite(runner, ip, port, ssl_context=ctx).start()
     phone = f"https://{ip}:{port}/m?t={token}"
-    screen = f"https://localhost:{port}/screen?t={token}"
+    screen = f"https://{ip}:{port}/screen?t={token}"
     print("\nLightferry phone TEST client (not part of the real air-gapped path)")
     print(f"cert SHA-256: {fp}")
     print(f"back-channel: {sess.backchannel}" + (f" (mic via {sess.mic.kind})" if sess.mic else "")
@@ -596,34 +597,15 @@ async def _main(path, key, host, port, out_dir, backchannel, stop_after, remote_
         await runner.cleanup()
 
 
-def serve(path, key, host: str = "0.0.0.0", port: int = 8443, out_dir=None, backchannel: str = "audio",
+def serve(path, key, host: str | None = None, port: int = 8443, out_dir=None, backchannel: str = "audio",
           _stop_after: float | None = None, remote_sender: bool = False) -> None:
-    """Blocking. `key` is the shared secret (bytes or str)."""
-    if isinstance(key, str):
-        key = key.encode()
+    """Blocking. `key` is the shared secret (bytes). `host` None = this machine's LAN address."""
     try:
         asyncio.run(_main(path, key, host, port, out_dir, backchannel, _stop_after, remote_sender))
     except KeyboardInterrupt:
         pass
 
 
-def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(prog="python -m lightferry.mobile", description=__doc__.split("\n")[0])
-    ap.add_argument("path", help="file/folder to send; with --remote-sender, the destination dir")
-    ap.add_argument("--key", required=True, help="shared secret (>= protocol.MIN_PSK_LEN bytes)")
-    ap.add_argument("--host", default="0.0.0.0")
-    ap.add_argument("--port", type=int, default=8443)
-    ap.add_argument("--out", default=None)
-    ap.add_argument("--backchannel", choices=["audio", "direct"], default="audio")
-    ap.add_argument("--remote-sender", action="store_true", help="receive from another machine's `lightferry send`")
-    ap.add_argument("--stop-after", type=float, default=None, help=argparse.SUPPRESS)
-    a = ap.parse_args(argv)
-    if a.remote_sender:
-        serve(None, a.key, a.host, a.port, a.out or a.path, _stop_after=a.stop_after, remote_sender=True)
-    else:
-        serve(a.path, a.key, a.host, a.port, a.out, a.backchannel, _stop_after=a.stop_after)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == "__main__":  # `python -m lightferry.mobile ...` == `lightferry mobile-serve ...`
+    from .cli import main
+    sys.exit(main(["mobile-serve", *sys.argv[1:]]))

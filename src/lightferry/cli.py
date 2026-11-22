@@ -12,6 +12,7 @@ import os
 import secrets
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 
@@ -84,9 +85,9 @@ def _status(eng, last: dict, role: str) -> None:
         pct = f" {done}/{total} tiles ({100 * done // total}%)" if total else ""
         print(f"[{role}] {eng.state}{pct}", end="\r" if total and eng.state == "DATA" else "\n", flush=True)
         last.update(k=key, s=eng.state, t=now)
-    if eng.verify_code and eng.verify_code != last.get("v"):  # confirmed automatically: logged for the record
+    if eng.verify_code and eng.verify_code != last.get("v") and eng.auto_confirm:  # test channels: logged only
         last["v"] = eng.verify_code
-        print(f"\n[{role}] verify code {eng.verify_code} (checked automatically)", flush=True)
+        print(f"\n[{role}] verify code {eng.verify_code} (confirmed automatically: test channel)", flush=True)
     if eng.warning and eng.warning != last.get("w"):
         last["w"] = eng.warning
         print(f"\n[{role}] WARNING: {eng.warning}", flush=True)
@@ -95,10 +96,38 @@ def _status(eng, last: dict, role: str) -> None:
 def _finish(eng, role: str) -> int:
     print()
     if eng.state == "CLOSED":
-        print(f"[{role}] transfer complete.")
+        if role == "S" and (eng.result or {}).get("confirmed") is False:
+            print(f"[{role}] transfer complete (unconfirmed: only the receiver's 16-bit audio token says so; "
+                  "check the receiver's console).")
+        else:
+            print(f"[{role}] transfer complete.")
         return 0
     print(f"[{role}] ABORTED: {eng.abort_reason}")
     return 1
+
+
+def operator_prompt(role: str):
+    """VERIFY on real hardware (PLAN section 6 step 4): show the code and ask y/N on the console. Returns a
+    ``confirm(code)`` for the engines: it starts the question on a thread and answers via
+    ``engine.operator_answer`` so the screen and camera keep running meanwhile. No answer -> VERIFY_TIMEOUT."""
+    box: dict = {}
+
+    def confirm(code: str):
+        def ask():
+            try:
+                ans = input(f"\n[{role}] VERIFY: does the other machine show {code}? [y/N] ")
+            except EOFError:
+                ans = ""
+            box["eng"].operator_answer(ans.strip().lower() in ("y", "yes"))
+        threading.Thread(target=ask, daemon=True).start()
+        return None  # pending
+    return confirm, box
+
+
+def _audio(a, role: str) -> bool:
+    if role == "s":
+        return a.backchannel == "audio" or (a.backchannel == "auto" and a.no_camera)
+    return a.backchannel == "audio"
 
 
 def build_endpoint(a, role: str, psk: bytes):
@@ -109,10 +138,13 @@ def build_endpoint(a, role: str, psk: bytes):
     if spec == "loop":
         raise ValueError("--camera loop is in-process only; use `lightferry selftest`")
     if spec.startswith("dir:"):
+        if _audio(a, role):  # dir: carries packets only; nothing would ever deliver R's note tokens
+            raise ValueError("--camera dir: works only with the camera back-channel; drop --backchannel audio / "
+                             "--no-camera")
         return channels.open_channel(spec, role), None, closers
     if spec != "webcam":
         raise ValueError("--camera must be webcam, dir:<path> or loop")
-    audio = a.backchannel == "audio" or (a.backchannel == "auto" and role == "s" and a.no_camera)
+    audio = _audio(a, role)
     screen = iop.ScreenSink(a.fullscreen)
     closers.append(screen)
     if role == "s":
@@ -143,20 +175,27 @@ def _tick_io(end, screen, now) -> None:
 
 # ---------------------------------------------------------------- send / receive
 
+def _auto(a) -> bool:
+    """VERIFY is confirmed automatically only on test channels (dir:, or --yes, which needs one)."""
+    return a.yes or a.camera != "webcam"
+
+
 def run_send(a, psk: bytes) -> int:
     from . import archive, handshake as hs
     from .link import LinkConfig, Profile, for_audio
     blob, manifest = archive.pack(a.path, a.compress)
     print(f"packed {manifest['name']}: {len(manifest['files'])} files, {manifest['raw_size']} B -> "
           f"{len(blob)} B ({manifest['compression']})")
-    audio = a.backchannel == "audio" or (a.backchannel == "auto" and a.no_camera)
+    audio = _audio(a, "s")
     # audio means the receiver is a phone or webcam filming from a distance: one large tile per frame reads
     # reliably, while 3x3 tiles shrink each module below what such a camera resolves
     prop = Profile(a.grid or 64, a.module_px or 6, a.tiles or (1 if audio else 3))
     cfg = LinkConfig(timeout=a.timeout, retries=a.retries)
-    snd = hs.Sender(psk, manifest, blob, cfg=for_audio(cfg) if audio else cfg, proposal=prop,
-                    backchannel="audio" if audio else "camera", auto_confirm=True)
+    confirm, box = operator_prompt("S")
     end, screen, closers = build_endpoint(a, "s", psk)
+    snd = box["eng"] = hs.Sender(psk, manifest, blob, cfg=for_audio(cfg) if audio else cfg, proposal=prop,
+                                 backchannel="audio" if audio else "camera", auto_confirm=_auto(a),
+                                 confirm=confirm)
     notes = hasattr(end.back, "accept")  # audio: R answers with note tokens, checked by the engine
     if notes:
         end.back.accept = lambda t: t in snd.expected
@@ -195,11 +234,13 @@ def run_send(a, psk: bytes) -> int:
 def run_receive(a, psk: bytes) -> int:
     from . import handshake as hs
     from .link import LinkConfig, for_audio
-    audio = a.backchannel == "audio"
+    audio = _audio(a, "r")
     cfg = LinkConfig(timeout=a.timeout, retries=a.retries)
-    rcv = hs.Receiver(psk, a.path, cfg=for_audio(cfg) if audio else cfg, announce=not audio,
-                      backchannel="audio" if audio else "camera", overwrite=a.overwrite, auto_confirm=True)
+    confirm, box = operator_prompt("R")
     end, screen, closers = build_endpoint(a, "r", psk)
+    rcv = box["eng"] = hs.Receiver(psk, a.path, cfg=for_audio(cfg) if audio else cfg, announce=not audio,
+                                   backchannel="audio" if audio else "camera", overwrite=a.overwrite,
+                                   auto_confirm=_auto(a), confirm=confirm)
     print(f"Receiver running: point the camera at the sender's screen. Saving to {a.path}. Keys in its window: "
           "f fullscreen, q quit.")
     last: dict = {}
@@ -286,6 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--retries", type=int, default=8)
     ap.add_argument("--overwrite", action="store_true", help="receiver: replace an existing item")
     ap.add_argument("--fullscreen", action="store_true", help="start the display window fullscreen")
+    ap.add_argument("--yes", action="store_true", help="test hook: auto-confirm VERIFY (only with --camera dir:)")
     c = ap.add_mutually_exclusive_group()
     c.add_argument("--compress", dest="compress", nargs="?", const="auto", default="auto",
                    choices=("auto", "lzma", "zlib", "none"), help="compression (default auto)")
@@ -309,7 +351,7 @@ def main(argv=None) -> int:
         sp.add_argument("--path", required=True, help="file/folder this machine sends to the phone; with "
                         "--remote-sender, the destination dir for what the phone receives")
         sp.add_argument("--port", type=int, default=8443)
-        sp.add_argument("--host", default="0.0.0.0")
+        sp.add_argument("--host", default=None, help="address to bind (default: this machine's LAN IP)")
         sp.add_argument("--backchannel", choices=("audio", "direct"), default="audio")
         sp.add_argument("--remote-sender", action="store_true",
                         help="the phone receives from another machine running `lightferry send --backchannel "
@@ -341,6 +383,8 @@ def main(argv=None) -> int:
         return _err("--path is required")
     try:
         a.tiles = parse_tiles(a.tiles)
+        if a.yes and a.camera == "webcam":
+            return _err("--yes is a test hook: only with --camera dir: (real hardware always asks VERIFY)")
         psk = load_key(a.key_file, a.key)
         if a.receive:
             if a.no_camera:

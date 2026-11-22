@@ -10,8 +10,8 @@ One pip-installable package `lightferry` (src layout, `pyproject.toml`, hatchlin
 -> `dist/lightferry-<ver>-py3-none-any.whl`; `pip install lightferry-*.whl`. Entry points: `lightferry =
 "lightferry.cli:main"` and `python -m lightferry`. `requires-python = ">=3.11.4"` (first 3.11 with `tarfile`
 `filter="data"`). Dependencies `numpy>=1.26`, `opencv-python>=4.8` (not `-headless`: needs `imshow`). Optional
-extras: `lightferry[audio]` = `sounddevice` (PortAudio, cross-platform); `lightferry[mobile]` = `websockets`,
-`cryptography` (self-signed cert), `segno` (terminal QR). Air-gapped: `pip download -d wheelhouse lightferry-*.whl`,
+extras: `lightferry[audio]` = `sounddevice` (PortAudio, cross-platform); `lightferry[mobile]` = `aiohttp`
+(HTTPS + WebSocket server), `cryptography` (self-signed cert), `segno` (terminal QR). Air-gapped: `pip download -d wheelhouse lightferry-*.whl`,
 then `pip install --no-index --find-links wheelhouse lightferry`; wheels must match target OS/arch/Python.
 ```
 Lightferry/  pyproject.toml README.md .env.example .gitignore (.env, *.key, logs/, dist/)  tests/  docs/PLAN.md
@@ -41,7 +41,8 @@ proposal. `--backchannel auto` = audio if S has no camera or `--no-camera`, else
 its `--path` is the output dir (created if missing), item at `<path>/<name>`, no overwrite without `--overwrite`.
 `--key`: key file (32 B `secrets.token_bytes`, mode 600, git-ignored, moved by hand); `LIGHTFERRY_KEY` = hex or
 `@path`; warn on hex in argv. `--yes` only with `--camera loop|dir:` (error with `webcam`); never skips VERIFY or
-y/N on real hardware. `loop` is in-process only (selftest, bench, pytest); two processes use `dir:`/`audio-dir:`.
+y/N on real hardware (as built: `webcam` asks y/N on the console; `dir:`/`loop` auto-confirm). `dir:` carries
+camera-channel packets only, so `dir:` with the audio back-channel is refused. `loop` is in-process only (selftest, bench, pytest); two processes use `dir:`/`audio-dir:`.
 
 ## 3. codec.py (layer 0: one code; v2 implemented, v3 next)
 N x N modules, 4x4 finders in the corners, each with a 1-module white separator ring on its two inner sides (9
@@ -122,6 +123,7 @@ frame. With `--backchannel audio` every R -> S message below goes over audio (se
    file|cmd, backchannel, caps {grids, module_px, tiles, compress (lzma only if it imports), max_res}. Camera mode:
    both sides show HELLO; a valid HELLO with our own role (both `--send`) -> ABORT ROLE_COLLISION on both; mode
    mismatch -> MODE_MISMATCH. Audio mode: only S shows HELLO; R requires role s (else ROLE_COLLISION on R's console).
+   compress: `lzma` is always offered (archive.py imports it unconditionally).
 2. **HELLO_ACK** (R -> S, MAC `K_hello_r`): nonce_S echo, nonce_R, chosen data profile (best common setting). S
    derives keys -> AUTHED. R derives keys when sending but is AUTHED only on the **first valid K_s2r packet** (SYNC,
    or READY/CMD in cmd mode), re-sending HELLO_ACK until then (proves S is live, not a replayed HELLO).
@@ -155,8 +157,8 @@ class Handoff:
 ## 7. archive.py
 S always builds a tar (file or folder, one code path), then compresses. Members: relative, forward-slash, NFC,
 sorted, mtime kept; symlinks/devices/FIFOs skipped and listed as `skipped`; nothing followed outside the root.
-`auto` (default) tries lzma (zlib if the optional `lzma` module does not import; then it is not offered in caps)
-and sends `none` if the result is not smaller than the tar. Extract: streaming decompression
+`auto` (default) tries lzma and zlib (the stdlib `lzma` module is required) and sends `none` if the result is not
+smaller than the tar. Extract: streaming decompression
 (`LZMADecompressor`/`zlib.decompressobj`, `max_length`), aborting once output exceeds the manifest's tar size;
 `tarfile` `filter="data"` plus own checks (absolute, `..`, drive letters, backslashes, links, non-regular files,
 reserved names, case-insensitive duplicates); total size must match. Extract into `<dest>/.lightferry-tmp-<session>`,
@@ -248,12 +250,20 @@ R a speaker; `sounddevice` (`lightferry[audio]`), clear startup error if missing
   No HELLO_ACK: keys come from the PSK and S's nonce only (R's nonce is fixed zero), S's proposal is the profile,
   and R's error reasons are not sent (S times out). A token is bound to the session (S's fresh nonce) and to the
   packet's counter, so it can't be replayed; 16 bits only resist guessing within one packet's short window, and a
-  forgery can at worst advance S without R (the archive sha256 check on R still guards integrity).
+  forgery can at worst advance S without R (the archive sha256 check on R still guards integrity). So S reports
+  an audio-mode success as **unconfirmed** (`result["confirmed"] = False`). S keeps few tokens valid at once:
+  only answers that fit its current state, for codes of the latest cycle (2 s grace after a re-sign) shown within
+  the last timeout (<= ~40 in the data phase, ~1 otherwise; was up to 128).
+  **Replay of a recorded S screen:** with R's nonce fixed, a recording would re-derive the same keys, so R keeps
+  every nonce_S it accepted in `<dest>/.lightferry-seen` (mode 600, newest 4096) and ignores a HELLO that reuses
+  one (fails closed with DEST_NOT_WRITABLE if it can't record it). A different dest has its own list.
 - **When R speaks** (audio): only for a never-seen packet that completes a step (a code still on screen asks
   nothing; no timer resends). When a full cycle ends and nothing was heard for 5 s (`link.for_audio`), S re-signs
   its codes with fresh counters, so a lost reply is asked for again.
 - **Untrusted audio**: 4 bytes is too short for a long-lived key, hence the session/direction/seq binding; 2^-32
-  odds per forgery attempt, capped by airtime and a rate limit (> 20 bad tags/min -> log, ignore that minute). A
+  odds per forgery attempt, capped by airtime and a rate limit (> 20 bad tags/min -> log, ignore that minute;
+  as built in `NoteListener`: a fully received transmission matching no expected token is a bad tag, and while
+  more than 20 arrived in the last minute accepted tokens are dropped too and counted in `suppressed`). A
   forgery can at worst stall a session (fake HELLO_ACK -> R rejects S's SYNC); integrity rests on the visual tags and
   archive sha256. Noise and bad tags never abort; only timeouts drive retries; audio ABORT needs a valid tag.
 ```python
@@ -280,15 +290,19 @@ audio`); a phone is R's camera and speaker, while R's logic (handshake, decode, 
   frame bytes to a `Float32Array` at the AudioContext rate (fs required); decoding stays in Python. Parity: Python
   golden vectors vs JS under node (skipped without node). Camera/audio start on a tap; screen wake lock.
 - **Remote sender** (`--remote-sender`): S is another machine (`lightferry send --no-camera --backchannel audio`);
-  the phone scans that machine's window. Only R runs in the server, and each sealed reply is played in
-  `io_platform.AudioBack`'s wire format (fragments <= 46 B, key `HMAC(psk, "lf-audio-tag")`, no context), so S's
-  mic reassembles it like any audio R. The in-process mode's hash-reference shortcut cannot cross machines.
+  the phone scans that machine's window. Only R runs in the server; its replies are the same 2-byte note tokens
+  (section 11, `acoustic.encode_notes`), played by the phone, and S's `io_platform.AudioBack` hears them with
+  `NoteListener` like any audio R. (The earlier fragment format is gone.) VERIFY is confirmed on the pages: the
+  screen page for an in-process S, the phone for R.
 - **Security**: off by default, separate subcommand, never in the real air-gapped path. Self-signed cert per run
-  (phones need HTTPS for camera/mic), fingerprint printed. 128-bit URL token, constant-time check on every HTTP/WS
-  request, one client, dies with the server. LAN interface only, no CORS, frame size/rate capped; PSK stays in Python.
+  (phones need HTTPS for camera/mic) in a fresh 0700 `mkdtemp` dir, key created 0600, removed once loaded;
+  fingerprint printed. 128-bit URL token, constant-time check on every HTTP/WS request, one WebSocket client (a
+  second gets 409), dies with the server. Binds the LAN IP only (`--host` overrides), no CORS, frame size/rate
+  capped; PSK stays in Python. `python -m lightferry.mobile` = `lightferry mobile-serve`.
 ```python
-async def serve(dest: Path, psk: bytes, host: str, port: int, audio_dir: Path | None = None) -> None
-def make_self_signed(host: str, out_dir: Path) -> tuple[Path, Path, str]   # cert, key, sha256 fingerprint
+def serve(path, key: bytes, host: str | None = None, port: int = 8443, out_dir=None, backchannel="audio",
+          remote_sender: bool = False) -> None                                   # blocking
+def make_self_signed(host: str, out_dir: Path | None = None) -> tuple[Path, Path, str]   # cert, key, sha256
 ```
 
 ## 13. Paths (paths.py) and benchmarks (`lightferry bench`)

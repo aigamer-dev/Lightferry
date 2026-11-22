@@ -566,13 +566,22 @@ class NoteListener:
     Keeps the last ~2 s, rescans them every 0.25 s of new audio, and tries every chirp peak under each
     copy hypothesis; a candidate counts only if ``accept(payload)`` is true (e.g. an expected keyed token), which
     is what rejects noise. Payloads already returned are not returned again until they leave the window.
+
+    Rate limit (PLAN section 11): a transmission that fully arrived but was not accepted counts as a bad tag.
+    While more than ``max_bad_per_min`` arrived in the last minute (someone probing, or noise that looks like
+    chirps), accepted payloads are dropped too and counted in ``suppressed``; S simply asks again later.
     """
 
     SCAN_S = 0.25
+    MAX_BAD_PER_MIN = 20
 
-    def __init__(self, fs: int, nbytes: int = 2, repeat: int = 2, accept=lambda b: True, threshold: float = 0.2):
+    def __init__(self, fs: int, nbytes: int = 2, repeat: int = 2, accept=lambda b: True, threshold: float = 0.2,
+                 max_bad_per_min: int = MAX_BAD_PER_MIN):
         self._g = _note_geo(fs)
         self.fs, self.nbytes, self.repeat, self.accept, self._thr = int(fs), nbytes, repeat, accept, threshold
+        self.max_bad = max_bad_per_min
+        self._bad: list[int] = []  # absolute start of each rejected transmission in the last minute
+        self.suppressed = 0
         self._nsym = 2 * nbytes
         self._clen = _copy_len(self._g, self._nsym)
         self._keep = repeat * self._clen + self.fs
@@ -593,10 +602,23 @@ class NoteListener:
         cut = max(0, len(self._buf) - self._keep)
         self._buf, self._base = self._buf[cut:], self._base + cut
         self._seen = {k: v for k, v in self._seen.items() if k >= self._base - self.repeat * self._clen}
+        end = self._base + len(self._buf)
+        self._bad = [b for b in self._bad if b >= end - 60 * self.fs]
         return self._scan()
 
+    @property
+    def limited(self) -> bool:
+        """True while the bad-tag rate limit is dropping everything."""
+        return len(self._bad) > self.max_bad
+
+    def _note_bad(self, start: int) -> None:
+        span = range(-(self.repeat - 1), self.repeat)  # the other copies of the same transmission
+        if not any(abs(start + k * self._clen - b) < self._g.m for b in self._bad for k in span):
+            self._bad.append(start)
+            del self._bad[:-1000]
+
     def _scan(self) -> list[bytes]:
-        g, x, out = self._g, self._buf, []
+        g, x, out, bad = self._g, self._buf, [], []
         if len(x) < g.m:
             return out
         norm = _norm_corr(x, g, True)
@@ -605,6 +627,7 @@ class NoteListener:
             starts = [self._base + p - c * self._clen for c in range(self.repeat)]
             if any(abs(st - s) < g.m for st in starts for s in self._seen):
                 continue  # a copy of a transmission already returned
+            accepted = False
             for c in range(self.repeat):  # which copy this chirp starts
                 start = starts[c]
                 tot, ok = 0, False
@@ -621,6 +644,15 @@ class NoteListener:
                 data = bytes((int(nib[i]) << 4) | int(nib[i + 1]) for i in range(0, len(nib), 2))
                 if self.accept(data):
                     self._seen[start] = data
-                    out.append(data)
+                    if self.limited:
+                        self.suppressed += 1
+                    else:
+                        out.append(data)
+                    accepted = True
                     break
+            if not accepted and p + self.repeat * self._clen <= len(x):  # it all arrived and still no match
+                bad.append(self._base + p)
+        for b in bad:  # a side peak of an accepted chirp is not a bad tag
+            if not any(abs(b - s) < g.m for s in self._seen):
+                self._note_bad(b)
         return out

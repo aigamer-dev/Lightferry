@@ -452,7 +452,7 @@ def tile_cells(warped: np.ndarray, grid: int, tiles_n: int, border: int = BORDER
     cell = grid + 2 * quiet
     outer = tiles_n * cell + 2 * border
     w = warped.shape[0]
-    ppm = int(np.clip(round(w / outer), 3, 8))
+    ppm = int(np.clip(round(w / outer), 6, 8))
     side = outer * ppm
     interp = cv2.INTER_AREA if side < w else cv2.INTER_CUBIC
     big = cv2.resize(warped, (side, side), interpolation=interp)

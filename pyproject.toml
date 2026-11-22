@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "lightferry"
-version = "0.0.1a1"
+version = "0.0.1a2"
 description = "Visual sneakernet: move files between air-gapped machines via screen-shown codes scanned by webcam."
 readme = "README.md"
 requires-python = ">=3.11.4"

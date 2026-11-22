@@ -4,7 +4,7 @@
 
 Lightferry is a visual sneakernet. The sender shows a stream of dense black-and-white matrix codes on its screen; the receiver reads them with a webcam. A pre-shared key signs every packet, and a 6-digit VERIFY code lets you confirm the session by eye. No network, no USB stick, no radio.
 
-> Status: early alpha (`0.0.1a1`). The codec, protocol, archive and handshake logic are covered by tests; the real webcam, screen and audio paths have had only light testing. See [Status and limitations](#status-and-limitations).
+> Status: early alpha (`0.0.1a2`). The codec, protocol, archive and handshake logic are covered by tests; the real webcam, screen and audio paths have had only light testing. See [Status and limitations](#status-and-limitations).
 
 Documentation: <https://lightferry.aigamer.dev>
 
@@ -89,6 +89,8 @@ lightferry mobile-serve --path ./my-folder --key-file lightferry.key
 
 The server binds this machine's LAN IP only (use `--host` to pick another address) and accepts one WebSocket client at a time (a second gets HTTP 409). Open the printed Phone URL on the phone (accept the self-signed certificate warning), press Start, and point it at the screen page; confirm the VERIFY code with the on-screen buttons on both the screen page and the phone. This is a test tool, not the real path. `python -m lightferry.mobile ...` is the same as `lightferry mobile-serve ...`.
 
+> **Local trial, no key at all?** Add `--open` to both commands (packets are then not authenticated; see the usage guide).
+>
 > **No key file?** Both machines can derive the key from a shared passphrase: set `LIGHTFERRY_PASSPHRASE` (12+ characters) instead of passing `--key-file`. See the usage guide.
 
 ## CLI reference
@@ -117,7 +119,7 @@ See [Security](https://lightferry.aigamer.dev/security/).
 
 ## Status and limitations
 
-- Early alpha `0.0.1a1`; formats and flags may change.
+- Early alpha `0.0.1a2`; formats and flags may change.
 - Real webcam, on-screen display and audio paths are lightly tested; expect tuning (`--grid`, `--module-px`, `--tiles`).
 - No error correction in the code itself: reliability comes from ack/retry, so throughput depends on camera quality.
 - Everything is held in RAM; large transfers need several times the data size in memory.

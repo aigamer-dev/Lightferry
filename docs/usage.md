@@ -116,3 +116,24 @@ lightferry --receive --path .\incoming
   `--key` or `--key-file`.
 - A passphrase is weaker than a random key file: anyone who records the codes can try guesses offline. Use a
   long, random phrase.
+
+## Open mode (no key, local trials)
+
+For two machines side by side with no network, you can skip keys entirely:
+
+```bash
+lightferry --send --no-camera --fullscreen --path ./folder --open
+lightferry --receive --path ./incoming --backchannel audio --open
+```
+
+`--open` (or `LIGHTFERRY_OPEN=1`) makes both sides use a fixed, public key. The HELLO/SYNC/START/DONE
+handshake, session nonces, CRC, replay window, SHA-256 and size checks and the hardened archive
+extraction all stay on. What changes:
+
+- Packets are **not authenticated**: anyone who can see the screen or hear the audio can inject or replay.
+- The 6-digit code is only logged and confirmed automatically. Add `--verify` to ask the operator y/N.
+- A keyed side and an open-mode side cannot talk to each other (`KEY_MISMATCH`).
+- `--open` cannot be combined with `--key`, `--key-file` or `--passphrase`. Without any of these, Lightferry
+  refuses to start and points to `--open`; open mode is never switched on silently.
+
+Use `--key-file` (see `lightferry keygen`) for real transfers.

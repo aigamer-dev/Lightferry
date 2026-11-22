@@ -54,3 +54,9 @@ Everything is held in RAM; plan for a few times the transfer size in memory.
 ## Reporting
 
 Report vulnerabilities privately through the repository's GitHub security advisories.
+
+## Open mode
+
+`--open` replaces the shared key with a public constant. It keeps the handshake, nonces, CRC, replay window,
+hash and size checks, but gives up authentication: an observer can inject or replay packets, and the operator
+VERIFY prompt is skipped unless `--verify` is given. It is for local trials only; use a key file otherwise.

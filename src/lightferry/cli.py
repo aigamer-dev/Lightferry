@@ -27,6 +27,15 @@ def _err(msg: str) -> int:
 
 # ---------------------------------------------------------------- keys
 
+# Open mode (--open / LIGHTFERRY_OPEN=1): both sides use this fixed, PUBLIC key. Packets are then NOT authenticated:
+# anyone who can see the screen or hear the audio can inject or replay. For local trials only.
+OPEN_PSK = __import__("hashlib").sha256(b"lightferry-open-mode-v1").digest()
+OPEN_WARNING = ("lightferry: warning: open mode: packets are NOT authenticated (anyone who can see the screen can "
+                "inject or replay) and the transfer is NOT confirmed by an operator (the 6-digit code is only logged; "
+                "add --verify to confirm it). Use --key-file for real transfers.")
+OPEN_WARNING_VERIFY = ("lightferry: warning: open mode: packets are NOT authenticated (anyone who can see the screen "
+                       "can inject or replay). The 6-digit code is still confirmed by an operator (--verify).")
+
 PASSPHRASE_MIN = 12
 PASSPHRASE_SALT = b"lightferry-psk-v1"  # fixed domain-separation salt: the same phrase gives the same key everywhere
 
@@ -46,10 +55,15 @@ def _read_passphrase(value: str) -> str:
     return value
 
 
-def load_key(key_file: str | None, key_hex: str | None, passphrase: str | None = None) -> bytes:
+def load_key(key_file: str | None, key_hex: str | None, passphrase: str | None = None,
+             open_mode: bool = False) -> bytes:
     """--key / --key-file / LIGHTFERRY_KEY first; a passphrase (--passphrase or LIGHTFERRY_PASSPHRASE) only when
     none of those is given. --passphrase together with --key/--key-file is an error."""
     from .protocol import MIN_PSK_LEN
+    if open_mode or (os.environ.get("LIGHTFERRY_OPEN") == "1" and not (key_hex or key_file or passphrase)):
+        if key_hex or key_file or passphrase:
+            raise ValueError("--open cannot be combined with --key, --key-file or --passphrase")
+        return OPEN_PSK
     if passphrase and (key_hex or key_file):
         raise ValueError("--passphrase cannot be combined with --key or --key-file")
     if not (key_hex or key_file or passphrase or os.environ.get("LIGHTFERRY_KEY")):
@@ -68,7 +82,7 @@ def load_key(key_file: str | None, key_hex: str | None, passphrase: str | None =
         src = os.environ.get("LIGHTFERRY_KEY", "")
         if not src:
             raise ValueError("no key: use --key-file FILE, --key HEX, LIGHTFERRY_KEY (create one with `lightferry keygen`) "
-                             "or a passphrase (LIGHTFERRY_PASSPHRASE or --passphrase)")
+                             "a passphrase (LIGHTFERRY_PASSPHRASE or --passphrase), or --open for an unauthenticated local trial")
     if src.startswith("@"):
         raw = Path(src[1:]).expanduser().read_bytes()
         try:
@@ -117,7 +131,7 @@ def _status(eng, last: dict, role: str) -> None:
         last.update(k=key, s=eng.state, t=now)
     if eng.verify_code and eng.verify_code != last.get("v") and eng.auto_confirm:  # test channels: logged only
         last["v"] = eng.verify_code
-        print(f"\n[{role}] verify code {eng.verify_code} (confirmed automatically: test channel)", flush=True)
+        print(f"\n[{role}] verify code {eng.verify_code} (confirmed automatically: test channel or open mode)", flush=True)
     if eng.warning and eng.warning != last.get("w"):
         last["w"] = eng.warning
         print(f"\n[{role}] WARNING: {eng.warning}", flush=True)
@@ -206,8 +220,9 @@ def _tick_io(end, screen, now) -> None:
 # ---------------------------------------------------------------- send / receive
 
 def _auto(a) -> bool:
-    """VERIFY is confirmed automatically only on test channels (dir:, or --yes, which needs one)."""
-    return a.yes or a.camera != "webcam"
+    """VERIFY is confirmed automatically on test channels (dir:, or --yes, which needs one) and in open mode
+    (no key, unless --verify): the code is then only logged."""
+    return a.yes or a.camera != "webcam" or getattr(a, "auto_verify", False)
 
 
 def run_send(a, psk: bytes) -> int:
@@ -357,6 +372,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--path", help="file/folder to send, or destination dir when receiving")
     ap.add_argument("--key-file", help="32-byte key file (or hex text), see `lightferry keygen`")
     ap.add_argument("--key", help="hex key (LEAKS to the process list; prefer --key-file / env LIGHTFERRY_KEY)")
+    ap.add_argument("--open", action="store_true", help="no key: use the public open-mode key (packets are NOT "
+                    "authenticated; local trials only; same as LIGHTFERRY_OPEN=1)")
+    ap.add_argument("--verify", action="store_true", help="open mode only: ask the operator y/N for the 6-digit "
+                    "code (open mode auto-confirms it and just logs the code)")
     ap.add_argument("--passphrase", help="derive the key from a passphrase (>= 12 chars; @FILE reads it from a file; "
                     "prefer env LIGHTFERRY_PASSPHRASE: command-line values leak to the process list)")
     ap.add_argument("--camera", default="webcam", help="webcam | dir:<path> | loop (loop: selftest only)")
@@ -403,9 +422,10 @@ def main(argv=None) -> int:
         sp.add_argument("--key-file")
         sp.add_argument("--key")
         sp.add_argument("--passphrase")
+        sp.add_argument("--open", action="store_true")
         a = sp.parse_args(rest)
         try:
-            key = load_key(a.key_file, a.key, a.passphrase)
+            key = load_key(a.key_file, a.key, a.passphrase, a.open)
             from . import mobile
         except ImportError as e:
             return _err(f"mobile-serve needs the 'mobile' extra / mobile module: {e}")
@@ -429,7 +449,10 @@ def main(argv=None) -> int:
         a.tiles = parse_tiles(a.tiles)
         if a.yes and a.camera == "webcam":
             return _err("--yes is a test hook: only with --camera dir: (real hardware always asks VERIFY)")
-        psk = load_key(a.key_file, a.key, a.passphrase)
+        psk = load_key(a.key_file, a.key, a.passphrase, a.open)
+        a.auto_verify = psk == OPEN_PSK and not a.verify
+        if psk == OPEN_PSK:
+            print(OPEN_WARNING_VERIFY if a.verify else OPEN_WARNING, file=sys.stderr, flush=True)
         if a.receive:
             if a.no_camera:
                 return _err("--receive needs a camera")

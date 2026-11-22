@@ -418,6 +418,9 @@ def threshold_values(vals: np.ndarray, mode: str = "local") -> np.ndarray:
         glob = 0.5 * (np.percentile(vals, 5) + np.percentile(vals, 95))
         thr = 0.6 * loc + 0.4 * glob
         return (vals < thr).astype(np.uint8)
+    if mode.startswith("loc"):  # "loc3", "loc5": threshold against the plain local mean, sigma in modules
+        loc = cv2.GaussianBlur(vals, (0, 0), float(mode[3:]), borderType=cv2.BORDER_REFLECT)
+        return (vals < loc).astype(np.uint8)
     if mode == "iter":
         # start from the local threshold, then re-estimate the light and dark levels from the modules of each class
         # only (masked mean, sigma 2 modules) and threshold at their mid-point: handles a sharp lighting step
@@ -462,6 +465,8 @@ def tile_cells(warped: np.ndarray, grid: int, tiles_n: int, border: int = BORDER
 
 _ATTEMPTS = (
     ("local", 0.0, 0.0, 0.3),
+    # real webcams (soft, uneven light): the 8-module blend above fails; a tight local mean copes
+    ("loc3", 0.0, 0.0, 0.3), ("loc5", 0.0, 0.0, 0.3),
     ("minmax", 0.0, 0.0, 0.3),
     ("iter", 0.0, 0.0, 0.3),
     ("otsu", 0.0, 0.0, 0.3),

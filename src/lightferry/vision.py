@@ -418,6 +418,25 @@ def threshold_values(vals: np.ndarray, mode: str = "local") -> np.ndarray:
         glob = 0.5 * (np.percentile(vals, 5) + np.percentile(vals, 95))
         thr = 0.6 * loc + 0.4 * glob
         return (vals < thr).astype(np.uint8)
+    if mode == "iter":
+        # start from the local threshold, then re-estimate the light and dark levels from the modules of each class
+        # only (masked mean, sigma 2 modules) and threshold at their mid-point: handles a sharp lighting step
+        m = threshold_values(vals, "local").astype(np.float32)
+        for _ in range(3):
+            dark, light = m, 1.0 - m
+            den_l = np.maximum(cv2.GaussianBlur(light, (0, 0), 2.0, borderType=cv2.BORDER_REFLECT), 1e-3)
+            den_d = np.maximum(cv2.GaussianBlur(dark, (0, 0), 2.0, borderType=cv2.BORDER_REFLECT), 1e-3)
+            lv = cv2.GaussianBlur(vals * light, (0, 0), 2.0, borderType=cv2.BORDER_REFLECT) / den_l
+            dv = cv2.GaussianBlur(vals * dark, (0, 0), 2.0, borderType=cv2.BORDER_REFLECT) / den_d
+            m = (vals < 0.5 * (lv + dv)).astype(np.float32)
+        return m.astype(np.uint8)
+    if mode == "minmax":
+        # edge-preserving: threshold at the mid-point of the local light and dark levels (7x7 modules), so a
+        # sharp lighting step across the code (half grey, half white) does not shift the threshold
+        kern = np.ones((7, 7), np.uint8)
+        hi = cv2.GaussianBlur(cv2.dilate(vals, kern), (0, 0), 1.5, borderType=cv2.BORDER_REFLECT)
+        lo = cv2.GaussianBlur(cv2.erode(vals, kern), (0, 0), 1.5, borderType=cv2.BORDER_REFLECT)
+        return (vals < 0.5 * (hi + lo)).astype(np.uint8)
     v = np.clip(vals, 0, 255).astype(np.uint8)
     t, _ = cv2.threshold(v.reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return (vals < t).astype(np.uint8)
@@ -443,6 +462,8 @@ def tile_cells(warped: np.ndarray, grid: int, tiles_n: int, border: int = BORDER
 
 _ATTEMPTS = (
     ("local", 0.0, 0.0, 0.3),
+    ("minmax", 0.0, 0.0, 0.3),
+    ("iter", 0.0, 0.0, 0.3),
     ("otsu", 0.0, 0.0, 0.3),
     ("local", 0.0, 0.0, 0.5),
     ("local", -0.2, 0.0, 0.3), ("local", 0.2, 0.0, 0.3),
